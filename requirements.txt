@@ -1,0 +1,12 @@
+# Runtime dependencies (get bundled INTO PEAK.exe)
+yt-dlp
+pandas
+mutagen
+openpyxl        # pandas needs this to read .xlsx files (Exportify Excel exports)
+
+# Build-time only (used to DO the packaging, not bundled)
+pyinstaller
+pyinstaller-hooks-contrib   # ships the pandas/etc. PyInstaller hooks that make this work smoothly
+pywebview>=5.0
+rapidfuzz>=3.0
+tqdm>=4.65

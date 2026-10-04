@@ -1,0 +1,34 @@
+# build artifacts
+build3/
+dist3/
+build/
+dist/
+__pycache__/
+*.pyc
+
+# venvs
+venv/
+build_venv/
+.venv/
+
+# local test scratch (kept out of the repo deliberately)
+test_*.py
+z*.py
+headless_*.py
+lyric_backfill*.py
+genre_sweep.py
+sweep_sidecars.py
+*.log
+sp_*.json
+sp_*.html
+_sp_*
+*.out
+
+# user data — never commit
+.env
+*.cookies.txt
+.peak_*
+*.opus
+*.lrc
+*.m3u
+failed_downloads.txt

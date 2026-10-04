@@ -66,6 +66,33 @@ class _C:
             setattr(self, k, v)
 
 
+
+_CJK_RE = re.compile(r"[\u3000-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\u3040-\u30ff]")
+
+
+def _cjk_sim(a, b):
+    """CJK coverage: how much of title-a's CJK chars appear in b. Recall-
+    based so candidates with extra decoration (歌詞付き, official tags) don't
+    get penalized. 0.0-1.0."""
+    ca = set(_CJK_RE.findall(a or ""))
+    if not ca:
+        return 0.0
+    cb = set(_CJK_RE.findall(b or ""))
+    if not cb:
+        return 0.0
+    inter = len(ca & cb)
+    return inter / len(ca)
+
+
+def _sim(a_title, b_title):
+    """Combined similarity: ascii-norm ratio OR CJK char overlap, whichever
+    is higher. Handles 陷入爱情 vs 陷入愛情 (traditional) and 伴奏版 suffixes
+    that _norm would strip to empty."""
+    s1 = _ratio(_norm(a_title), _norm(b_title))
+    s2 = _cjk_sim(a_title, b_title)
+    return s1 if s1 >= s2 else s2
+
+
 def strict_match(candidates, title, artist, target_seconds=None,
                  min_fuzz=65,
                  caps_on=True, cap_min_s=40, cap_max_s=720,
@@ -103,9 +130,19 @@ def strict_match(candidates, title, artist, target_seconds=None,
             continue
         t_norm = _norm(c.title)
         t_tokens = set(w for w in t_norm.split() if len(w) > 2)
-        # word-overlap requirement (kills "Don't Be A Hero" -> "Don't Run")
+        # word-overlap requirement (kills "Don't Be A Hero" -> "Don't Run").
+        # CJK bridges: (a) CJK query title covered by candidate title,
+        # (b) CJK ARTIST appears verbatim in candidate title/channel — the
+        # uploader named the artist, so it's the right song even when the
+        # title itself is romanized.
         if q_tokens and not (q_tokens & t_tokens):
-            continue
+            _t_cjk_ok = (_CJK_RE.search(title)
+                         and _cjk_sim(title, c.title) >= 0.5)
+            _a_cjk_ok = (_CJK_RE.search(artist)
+                         and _cjk_sim(artist, c.title + " " + c.channel)
+                         >= 0.6)
+            if not (_t_cjk_ok or _a_cjk_ok):
+                continue
         if caps_on and c.seconds is not None:
             if c.seconds < cap_min_s or c.seconds > cap_max_s:
                 continue
@@ -136,9 +173,15 @@ def strict_match(candidates, title, artist, target_seconds=None,
         rel = (n - rel_pos[c.id]) / n
         pop = (n - pop_pos[c.id]) / n
         c.score = rel * 0.55 + pop * 0.45
-        # fuzzy floors — anything too far from the query gets zeroed
+        # fuzzy floors — anything too far from the query gets zeroed.
+        # CJK queries: the ascii fuzz is meaningless; use the CJK bridge.
         fz_full = _ratio(q_full, _norm(f"{c.channel} {c.title}"))
-        if fz_full < min_fuzz:
+        cjk_ok = ((_CJK_RE.search(title)
+                   and _cjk_sim(title, c.title) >= 0.5)
+                  or (_CJK_RE.search(artist)
+                      and _cjk_sim(artist, c.title + " " + c.channel)
+                      >= 0.6))
+        if fz_full < min_fuzz and not cjk_ok:
             c.score -= 0.8
         # junk word penalties (unless in query)
         t_norm = _norm(c.title)

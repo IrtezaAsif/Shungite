@@ -15,7 +15,28 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-CLIENT_ID_PATH = os.path.join(os.path.expanduser("~"), ".peak_spotify_client_id")
+_data_file_compat = None
+
+
+def _data_dir():
+    base = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
+    low = os.path.normpath(os.path.join(os.path.dirname(base), "LocalLow"))
+    d = os.path.join(low, "Shungite")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+def _data_file(name):
+    new = os.path.join(_data_dir(), name)
+    legacy = os.path.join(os.path.expanduser("~"), name)
+    try:
+        if not os.path.exists(new) and os.path.isfile(legacy):
+            import shutil as _sh
+            _sh.copy2(legacy, new)
+    except Exception:
+        pass
+    return new
+
+CLIENT_ID_PATH = _data_file(".peak_spotify_client_id")
 CLIENT_IDS_PATH = os.path.join(os.path.expanduser("~"),
                                ".peak_spotify_client_ids.json")
 

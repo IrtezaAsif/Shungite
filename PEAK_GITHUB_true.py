@@ -101,11 +101,54 @@ def detect_deno():
             return c
     return None
 
+# ── no console flashes: every child process (yt-dlp's ffmpeg, whisperX,
+# deno) inherits CREATE_NO_WINDOW unless it asks for something else. This
+# is what keeps the GUI window the ONLY thing on screen.
+import subprocess as _sp
+_orig_popen = _sp.Popen
+def _quiet_popen(*args, **kw):
+    if not kw.get("creationflags"):
+        kw["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
+    return _orig_popen(*args, **kw)
+_sp.Popen = _quiet_popen
+_orig_run = _sp.run
+def _quiet_run(*args, **kw):
+    if not kw.get("creationflags"):
+        kw["creationflags"] = 0x08000000
+    return _orig_run(*args, **kw)
+_sp.run = _quiet_run
+
 DEN_PATH = detect_deno()
 if DEN_PATH:
     os.environ["JS_RUNTIMES"] = f"deno:{DEN_PATH}"
 
-LIBRARY_ROOT = os.path.join(os.path.expanduser("~"), "Desktop", "Downloaded_Media2.0")
+# ── Data directory: %LOCALAPPDATA%\..\LocalLow\Shungite ─────────────
+def _data_dir():
+    """All SHUNGITE user data lives here (LocalLow\Shungite). Created on
+    first run; the old ~/.peak_* files are migrated transparently."""
+    base = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
+    low = os.path.normpath(os.path.join(os.path.dirname(base), "LocalLow"))
+    d = os.path.join(low, "Shungite")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+DATA_DIR = _data_dir()
+
+def _data_file(name):
+    """Path to a data file under LocalLow\Shungite. Migrates a legacy
+    ~/.peak_<name> file into the new home on first touch."""
+    new = os.path.join(DATA_DIR, name)
+    legacy = os.path.join(os.path.expanduser("~"), name)
+    try:
+        if not os.path.exists(new) and os.path.exists(legacy) \
+                and os.path.isfile(legacy):
+            shutil.copy2(legacy, new)
+    except Exception:
+        pass
+    return new
+
+LIBRARY_ROOT = _data_file("Music Library")
+os.makedirs(LIBRARY_ROOT, exist_ok=True)
 def _disk_ok(path, min_gb=2.0):
     """True if the drive holding `path` has more than min_gb free."""
     try:
@@ -117,8 +160,8 @@ def _disk_ok(path, min_gb=2.0):
 
 DEFAULT_OUT = LIBRARY_ROOT
 
-CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".peak_config.json")
-HISTORY_PATH = os.path.join(os.path.expanduser("~"), ".peak_history.json")
+CONFIG_PATH = _data_file(".peak_config.json")
+HISTORY_PATH = _data_file(".peak_history.json")
 
 BROWSERS = ["firefox", "chrome", "chromium", "edge", "brave", "opera", "safari", "vivaldi"]
 
@@ -361,8 +404,7 @@ def download_one(title, url, save_path, dtype, quality, speed_limit,
     # login cookies so a logged-in session is always used when available.
     _cf = cookiefile
     if not (_cf and os.path.isfile(_cf) and os.path.getsize(_cf) > 100):
-        _harvest = os.path.join(os.path.expanduser("~"),
-                                ".peak_yt_cookies.txt")
+        _harvest = _data_file(".peak_yt_cookies.txt")
         if os.path.isfile(_harvest) and os.path.getsize(_harvest) > 500:
             _cf = _harvest
         else:
@@ -759,8 +801,7 @@ def download_one(title, url, save_path, dtype, quality, speed_limit,
                 if _needs_cookies and not current_opts.get("cookiefile"):
                     # one-shot cookie fallback — the webview (embedded-login) cookies
                     # save anonymous runs that hit YouTube's "Sign in" wall.
-                    _cff = os.path.join(os.path.expanduser("~"),
-                                        ".peak_yt_cookies.txt")
+                    _cff = _data_file(".peak_yt_cookies.txt")
                     if os.path.isfile(_cff):
                         current_opts["cookiefile"] = _cff
                         current_opts.pop("cookiesfrombrowser", None)
@@ -773,8 +814,7 @@ def download_one(title, url, save_path, dtype, quality, speed_limit,
                     # Don't trust "unavailable" on the first hit — it hides
                     # region-lock walls, age gates, PO-token checks, bot walls.
                     # Try saved cookies + web_embedded client before believing it.
-                    _cff = os.path.join(os.path.expanduser("~"),
-                                        ".peak_yt_cookies.txt")
+                    _cff = _data_file(".peak_yt_cookies.txt")
                     _did_fallback = False
                     if not current_opts.get("cookiefile") and os.path.isfile(_cff):
                         current_opts["cookiefile"] = _cff
@@ -1089,7 +1129,7 @@ def _probe_meta(vid):
         _o = {"quiet": True, "extract_flat": True, "skip_download": True,
               "no_warnings": True}
         try:
-            _ck = os.path.join(os.path.expanduser("~"), ".peak_yt_cookies.txt")
+            _ck = _data_file(".peak_yt_cookies.txt")
             if os.path.isfile(_ck) and os.path.getsize(_ck) > 500:
                 _o["cookiefile"] = _ck
         except Exception:
@@ -1338,6 +1378,116 @@ class App:
         self._header()
         self._notebook()
         self._footer()
+        # ── First-run WIZARD: guides new users (folder → login → done) ──
+        try:
+            self._maybe_run_wizard()
+        except Exception:
+            pass
+
+    def _maybe_run_wizard(self):
+        """One-time setup wizard on first launch. Steps:
+        1. Welcome  2. Pick Music library folder  3. Optional YouTube login
+        4. Finish. Writes config so it never shows again."""
+        if self.cfg.get("wizard_done"):
+            return
+        win = tk.Toplevel(self.root)
+        win.title("SHUNGITE — Setup Wizard")
+        win.geometry("560x400")
+        win.configure(bg=BG)
+        win.grab_set()
+        step = {"n": 0}
+        chosen = {"lib": LIBRARY_ROOT}
+
+        def go(n):
+            step["n"] = n
+            for w in win.winfo_children():
+                w.destroy()
+            if n == 0:
+                tk.Label(win, text="◆ SHUNGITE", font=("Segoe UI", 22, "bold"),
+                         bg=BG, fg=FG).pack(pady=(40, 6))
+                tk.Label(win, text="YouTube Music + Spotify Downloader",
+                         bg=BG, fg="#9aa4b2").pack()
+                tk.Label(win, text="\nLet's set you up in 3 quick steps.",
+                         bg=BG, fg=FG).pack(pady=16)
+                tk.Label(win, text="Downloads land as Artist - Title.opus with\n"
+                                   "embedded cover art, synced lyrics, genre and\n"
+                                   "the YouTube link.",
+                         bg=BG, fg="#9aa4b2", justify="center").pack()
+                tk.Button(win, text="Start Setup  →", bg=GREEN, fg="#051405",
+                          font=("Segoe UI", 11, "bold"), relief="flat",
+                          command=lambda: go(1)).pack(pady=28, ipadx=14, ipady=4)
+            elif n == 1:
+                tk.Label(win, text="Step 1 of 3 — Your Music Library",
+                         font=("Segoe UI", 13, "bold"),
+                         bg=BG, fg=GOLD).pack(pady=(26, 8))
+                tk.Label(win, text="Pick where Music/ and Playlists/ should live.",
+                         bg=BG, fg="#9aa4b2").pack()
+                v = tk.StringVar(value=chosen["lib"])
+                e = tk.Entry(win, textvariable=v, bg=BG3, fg=FG,
+                             font=("Segoe UI", 10), relief="flat", width=58)
+                e.pack(pady=14, ipady=4)
+                def browse():
+                    d = filedialog.askdirectory(title="Choose library folder")
+                    if d:
+                        v.set(d)
+                tk.Button(win, text="Browse…", bg=BG3, fg=FG, relief="flat",
+                          command=browse).pack()
+                def nxt():
+                    chosen["lib"] = v.get().strip()
+                    go(2)
+                tk.Button(win, text="Next  →", bg=GREEN, fg="#051405",
+                          font=("Segoe UI", 11, "bold"), relief="flat",
+                          command=nxt).pack(pady=22, ipadx=14, ipady=4)
+            elif n == 2:
+                tk.Label(win, text="Step 2 of 3 — YouTube Login (recommended)",
+                         font=("Segoe UI", 13, "bold"),
+                         bg=BG, fg=GOLD).pack(pady=(26, 8))
+                tk.Label(win, text="Logging into YouTube inside SHUNGITE avoids\n"
+                                   "bot-checks and unlocks your Premium quality.\n"
+                                   "You can skip this and do it later in Settings.",
+                         bg=BG, fg="#9aa4b2", justify="center").pack()
+                def do_login():
+                    win.destroy()
+                    self.cfg["wizard_done"] = True
+                    self.cfg["library_root"] = chosen["lib"]
+                    self.cfg["output_dir"] = chosen["lib"]
+                    save_config(self.cfg)
+                    try:
+                        self._yt_login()
+                    except Exception:
+                        pass
+                def skip():
+                    go(3)
+                row = tk.Frame(win, bg=BG); row.pack(pady=20)
+                tk.Button(row, text="Log in to YouTube", bg=GREEN, fg="#051405",
+                          font=("Segoe UI", 11, "bold"), relief="flat",
+                          command=do_login).pack(side="left", padx=6, ipadx=8, ipady=4)
+                tk.Button(row, text="Skip for now", bg=BG3, fg=FG,
+                          relief="flat", command=skip).pack(side="left", padx=6,
+                                                             ipadx=8, ipady=4)
+            else:
+                self.cfg["wizard_done"] = True
+                self.cfg["library_root"] = chosen["lib"]
+                self.cfg["output_dir"] = chosen["lib"]
+                save_config(self.cfg)
+                # refresh path fields on every tab
+                try:
+                    self._sdir.delete(0, tk.END); self._sdir.insert(0, chosen["lib"])
+                    self._bdir.delete(0, tk.END); self._bdir.insert(0, chosen["lib"])
+                    self._bout.delete(0, tk.END); self._bout.insert(0, chosen["lib"])
+                except Exception:
+                    pass
+                tk.Label(win, text="✓ You're all set!",
+                         font=("Segoe UI", 16, "bold"),
+                         bg=BG, fg=GREEN).pack(pady=(50, 8))
+                tk.Label(win, text="Library: " + chosen["lib"][:44] + "\n\n"
+                                   "Paste a link in Single, or open Batch CSV\n"
+                                   "and point it at exported Spotify CSVs.",
+                         bg=BG, fg="#9aa4b2", justify="center").pack()
+                tk.Button(win, text="Done", bg=GREEN, fg="#051405",
+                          font=("Segoe UI", 11, "bold"), relief="flat",
+                          command=win.destroy).pack(pady=24, ipadx=16, ipady=4)
+        go(0)
 
     def _ui(self, fn):
         try:
@@ -1383,7 +1533,7 @@ class App:
                 save_config(self.cfg)
             except Exception:
                 pass
-        h = os.path.join(os.path.expanduser("~"), ".peak_yt_cookies.txt")
+        h = _data_file(".peak_yt_cookies.txt")
         if os.path.isfile(h) and os.path.getsize(h) > 500:
             return h
         return None
@@ -1613,10 +1763,6 @@ class App:
                         font=("Segoe UI", 7, "italic"))
 
     # ── Tab: Single ──────────────────────────────────────────────────────
-
-        _prefs_card = tk.Frame(o, bg=BG2)
-        _prefs_card.pack(fill="x", padx=8, pady=2)
-        self._search_prefs_row(_prefs_card, "src_single")
     def _tab_single(self, nb):
         o = tk.Frame(nb, bg=BG)
         nb.add(o, text="  Single  ")
@@ -1741,10 +1887,6 @@ class App:
                 pass
 
     # ── Tab: Playlist ────────────────────────────────────────────────────
-
-        _prefs_card = tk.Frame(o, bg=BG2)
-        _prefs_card.pack(fill="x", padx=8, pady=2)
-        self._search_prefs_row(_prefs_card, "src_playlist")
     def _tab_playlist(self, nb):
         o = tk.Frame(nb, bg=BG)
         nb.add(o, text="  Playlist  ")
@@ -1842,10 +1984,6 @@ class App:
         threading.Thread(target=run, daemon=True).start()
 
     # ── Tab: Search ──────────────────────────────────────────────────────
-
-        _prefs_card = tk.Frame(o, bg=BG2)
-        _prefs_card.pack(fill="x", padx=8, pady=2)
-        self._search_prefs_row(_prefs_card, "src_search")
     def _tab_search(self, nb):
         o = tk.Frame(nb, bg=BG)
         nb.add(o, text="  Search  ")
@@ -2144,10 +2282,6 @@ class App:
                 _i("_cap_min_spin", 40),
                 _i("_cap_max_spin", 720))
 
-
-        _prefs_card = tk.Frame(o, bg=BG2)
-        _prefs_card.pack(fill="x", padx=8, pady=2)
-        self._search_prefs_row(_prefs_card, "src_batch")
     def _tab_batch(self, nb):
         o = tk.Frame(nb, bg=BG)
         nb.add(o, text="  Batch CSV  ")
@@ -2661,15 +2795,6 @@ class App:
         threading.Thread(target=run, daemon=True).start()
 
 
-
-
-
-
-    # ── Tab: Spotify ─────────────────────────────────────────────────────
-
-        _prefs_card = tk.Frame(o, bg=BG2)
-        _prefs_card.pack(fill="x", padx=8, pady=2)
-        self._search_prefs_row(_prefs_card, "src_spotify")
     def _tab_spotify(self, nb):
         o = tk.Frame(nb, bg=BG)
         nb.add(o, text="  Spotify  ")
@@ -3945,10 +4070,6 @@ class App:
 
 
     # ── Tab: YT Music ──────────────────────────────────────────────────────
-
-        _prefs_card = tk.Frame(o, bg=BG2)
-        _prefs_card.pack(fill="x", padx=8, pady=2)
-        self._search_prefs_row(_prefs_card, "src_ytm")
     def _tab_ytm(self, nb):
         o = tk.Frame(nb, bg=BG)
         nb.add(o, text="  YT Music  ")
@@ -7556,7 +7677,7 @@ class App:
         if not f:
             return
         try:
-            dst = os.path.join(os.path.expanduser("~"), ".peak_yt_cookies.txt")
+            dst = _data_file(".peak_yt_cookies.txt")
             _sh.copyfile(f, dst)
             self.cfg["yt_cookies_file"] = dst
             save_config(self.cfg)
@@ -7570,7 +7691,7 @@ class App:
         """Open an EMBEDDED browser (inside the app) at Google/YouTube sign-in.
         The window keeps its own cookie profile; we harvest it for yt-dlp."""
         import os as _os, threading as _th, shutil as _sh
-        profile = _os.path.join(_os.path.expanduser("~"), ".peak_webview")
+        profile = _data_file(".peak_webview")
         # Start fresh: remove any prior profile so Google shows the full
         # account chooser (instead of auto-logging the previously used account).
         try:
@@ -7621,12 +7742,12 @@ class App:
         webview to drop the session server-side."""
         import os as _os, shutil as _sh, threading as _th
 
-        profile = _os.path.join(_os.path.expanduser("~"), ".peak_webview")
-        cookie_file = _os.path.join(_os.path.expanduser("~"), ".peak_yt_cookies.txt")
+        profile = _data_file(".peak_webview")
+        cookie_file = _data_file(".peak_yt_cookies.txt")
 
         # 1) remove the exported cookies.txt
         for cf in (cookie_file,
-                   _os.path.join(_os.path.expanduser("~"), ".peak_yt_cookies.txt")):
+                   _data_file(".peak_yt_cookies.txt")):
             try:
                 if _os.path.exists(cf):
                     _os.remove(cf)
@@ -7643,7 +7764,7 @@ class App:
         # 3) reset the config pointer so downloads stop using stale cookies
         self.cfg["yt_cookies_file"] = ""
         try:
-            cfgp = _os.path.join(_os.path.expanduser("~"), ".peak_config.json")
+            cfgp = _data_file(".peak_config.json")
             import json as _json
             _c = {}
             if _os.path.exists(cfgp):

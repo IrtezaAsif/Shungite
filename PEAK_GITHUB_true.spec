@@ -1,6 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 # Build with: pyinstaller PEAK_GITHUB_true.spec --noconfirm
-# Output: dist/PEAK_GITHUB_true/PEAK_GITHUB_true.exe (onedir)
+# Output: dist3/Shungite/Shungite.exe (onedir, no console)
 
 import os
 from PyInstaller.utils.hooks import collect_submodules
@@ -53,7 +53,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name="PEAK_GITHUB_true",
+    name="Shungite",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -76,5 +76,5 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name="PEAK_GITHUB_true",
+    name="Shungite",
 )

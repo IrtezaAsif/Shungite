@@ -1,5 +1,7 @@
 """Namida-compatibility enrichment upgrade for TITANIUM.
 
+
+
 Covers the gaps found in real-library testing:
 - Cover art: iTunes -> YouTube thumbnail fallback (maxres->sd->hq)
 - Lyrics: lrclib synced/plain -> YouTube description (via yt-dlp)
@@ -11,6 +13,25 @@ import re
 import time
 import urllib.parse
 import urllib.request
+
+def _data_dir():
+    base = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
+    low = os.path.normpath(os.path.join(os.path.dirname(base), "LocalLow"))
+    d = os.path.join(low, "Shungite")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+def _data_file(name):
+    new = os.path.join(_data_dir(), name)
+    legacy = os.path.join(os.path.expanduser("~"), name)
+    try:
+        if not os.path.exists(new) and os.path.isfile(legacy):
+            import shutil as _sh
+            _sh.copy2(legacy, new)
+    except Exception:
+        pass
+    return new
+
 
 UA = {"User-Agent": "TITANIUM/1.0 (music downloader)"}
 
@@ -761,8 +782,7 @@ def fetch_cover_url_lastfm(title, artist="", api_key=""):
     return None
 
 
-LASTFM_KEY_FILE = os.path.join(os.path.expanduser("~"),
-                               ".peak_lastfm_key")
+LASTFM_KEY_FILE = _data_file(".peak_lastfm_key")
 
 
 DEFAULT_LASTFM_KEY = "6cb7d46a61b1542abe98b0a8a58e528e"
@@ -778,7 +798,7 @@ def lastfm_key():
 
 
 def _lastfm_key():
-    p = os.path.join(os.path.expanduser("~"), ".peak_lastfm_key")
+    p = _data_file(".peak_lastfm_key")
     try:
         return open(p, encoding="utf-8").read().strip()
     except Exception:
@@ -895,8 +915,7 @@ def _ffmpeg_path():
     return "ffmpeg"
 
 
-LYRIC_LANG_FILE = os.path.join(os.path.expanduser("~"),
-                               ".peak_lyric_lang")
+LYRIC_LANG_FILE = _data_file(".peak_lyric_lang")
 
 
 def lyric_lang():

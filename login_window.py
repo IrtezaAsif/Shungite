@@ -1,5 +1,24 @@
 """Embedded login browser for SHUNGITE — runs pywebview IN-PROCESS on the main thread.
 
+
+
+def _data_dir():
+    base = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
+    low = os.path.normpath(os.path.join(os.path.dirname(base), "LocalLow"))
+    d = os.path.join(low, "Shungite")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+def _data_file(name):
+    new = os.path.join(_data_dir(), name)
+    legacy = os.path.join(os.path.expanduser("~"), name)
+    try:
+        if not os.path.exists(new) and os.path.isfile(legacy):
+            import shutil as _sh
+            _sh.copy2(legacy, new)
+    except Exception:
+        pass
+    return new
 Restored to match the known-good 2026-09-15 build: the login page opens in an
 EMBEDDED WebView2 window inside the app (never the system default browser) and
 its cookies persist to `cookie_dir`/`storage_path` so browser_cookies can
@@ -55,7 +74,7 @@ class LoginWindow:
 
 
 def _default_profile_dir():
-    return os.path.join(os.path.expanduser("~"), ".peak_webview")
+    return _data_file(".peak_webview")
 
 
 def open_login(url, title="Login", cookie_capture=None, timeout=600,

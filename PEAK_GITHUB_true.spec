@@ -21,6 +21,17 @@ hidden = (
        "webview.platforms.windowsforms", "clr", "clr_loader", "pythonnet"]
 )
 
+# deno (optional JS runtime for yt-dlp challenges): bundle when present
+# locally, skip on machines without it. detect_deno() falls back to PATH at
+# runtime, so a missing deno is fine.
+_deno = os.path.join(os.path.expanduser("~"), ".deno", "bin", "deno.exe")
+if not os.path.isfile(_deno):
+    for _cand in (r"C:\Program Files\deno\deno.exe", "deno\deno.exe"):
+        if os.path.isfile(_cand):
+            _deno = _cand
+            break
+_extra_datas = [(_deno, "deno")] if os.path.isfile(_deno) else []
+
 a = Analysis(
     ["PEAK_GITHUB_true.py"],
     pathex=[],
@@ -28,13 +39,12 @@ a = Analysis(
     datas=[
         ("ffmpeg/ffmpeg.exe", "ffmpeg"),
         ("ffmpeg/ffprobe.exe", "ffmpeg"),
-        (r"C:\Users\Itsa\.deno\bin\deno.exe", "deno"),
         ("spotify_api.py", "."),
         ("browser_cookies.py", "."),
         ("login_window.py", "."),
         ("matchers.py", "."),
-    ],
-    hiddenimports=hidden,
+    ] + _extra_datas,
+hiddenimports=hidden,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -54,6 +64,8 @@ exe = EXE(
     [],
     exclude_binaries=True,
     name="Shungite",
+    version="version_info.txt",
+    icon=r"installer/shungite.ico",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

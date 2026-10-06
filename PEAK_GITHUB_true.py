@@ -16,6 +16,7 @@ in ~/.peak_config.json on first run.
 """
 
 import yt_dlp
+import shutil
 import pandas as pd
 
 # --- DPI awareness: must run BEFORE Tk and before WebView2 initializes. ---
@@ -124,7 +125,7 @@ if DEN_PATH:
 
 # ── Data directory: %LOCALAPPDATA%\..\LocalLow\Shungite ─────────────
 def _data_dir():
-    """All SHUNGITE user data lives here (LocalLow\Shungite). Created on
+    """All SHUNGITE user data lives here (LocalLow\\Shungite). Created on
     first run; the old ~/.peak_* files are migrated transparently."""
     base = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
     low = os.path.normpath(os.path.join(os.path.dirname(base), "LocalLow"))
@@ -135,7 +136,7 @@ def _data_dir():
 DATA_DIR = _data_dir()
 
 def _data_file(name):
-    """Path to a data file under LocalLow\Shungite. Migrates a legacy
+    """Path to a data file under LocalLow\\Shungite. Migrates a legacy
     ~/.peak_<name> file into the new home on first touch."""
     new = os.path.join(DATA_DIR, name)
     legacy = os.path.join(os.path.expanduser("~"), name)
@@ -256,7 +257,7 @@ def build_opts(download_type, save_path, outtmpl, audio_quality="opus256",
     }
 
     # Browser cookies: system browser via yt-dlp, OR a user-supplied cookies.txt
-    _premium_slot = quality in ("opusprem", "opusnative", "flac")
+    _premium_slot = audio_quality in ("opusprem", "opusnative", "flac")
     if browser and browser != "none" and not _premium_slot:
         opts["cookiesfrombrowser"] = (browser,)
     cf = _cfg_get("yt_cookies_file", "")
@@ -285,8 +286,17 @@ def build_opts(download_type, save_path, outtmpl, audio_quality="opus256",
                 {"key": "EmbedThumbnail"},
             ]
         elif audio_quality == "best":
+            # 'best' is not a valid FFmpegExtractAudio codec — it made
+            # every best-quality download fail. Opus without a quality
+            # value = pure stream copy for opus sources (no re-encode).
             opts["postprocessors"] = [
-                {"key": "FFmpegExtractAudio", "preferredcodec": "best"},
+                {"key": "FFmpegExtractAudio", "preferredcodec": "opus"},
+                {"key": "FFmpegMetadata", "add_metadata": True},
+                {"key": "EmbedThumbnail"},
+            ]
+        elif audio_quality == "m4a":
+            opts["postprocessors"] = [
+                {"key": "FFmpegExtractAudio", "preferredcodec": "m4a"},
                 {"key": "FFmpegMetadata", "add_metadata": True},
                 {"key": "EmbedThumbnail"},
             ]
@@ -398,6 +408,12 @@ def download_one(title, url, save_path, dtype, quality, speed_limit,
         "embedmetadata": True,
         "format": "bestaudio/best",
         "progress_hooks": [hook],
+        # YouTube JS-challenge solver component: yt-dlp must fetch its
+        # remote solver (from GitHub) when the local cache lacks it —
+        # without it every download in a fresh install dies with
+        # "The page needs to be reloaded" (exe-only failure; source
+        # installs had it cached).
+        "remote_components": ["ejs:github"],
     }
     # ── cookies: the #1 reason downloads fail is bot-checks on anonymous
     # requests. Wire the cookiefile through; fall back to the harvested
@@ -456,16 +472,19 @@ def download_one(title, url, save_path, dtype, quality, speed_limit,
         opts["sponsorblock_mark"] = ["sponsor", "intro", "outro",
                                      "selfpromo"]
 
-    # Anonymous by default. Browser cookies are needed only for SPDK-level premium
-    # quality (opusprem/opusnative/flac). Plain downloads never lift browser sessions.
-    if browser and browser != "none":
+    # Cookie policy (2026-10): YouTube bot-checks anonymous mass downloads
+    # hard ("Sign in to confirm you're not a bot" / format refusals). Use the
+    # HARVESTED cookie jar (stable file, not the live browser session) for
+    # every audio download; it carries a logged-in session without lifting
+    # the user's live Firefox. Harvest file wins over browser cookies.
+    _harvest = _data_file(".peak_yt_cookies.txt")
+    if os.path.isfile(_harvest) and os.path.getsize(_harvest) > 500:
+        opts["cookiefile"] = _harvest
+    elif browser and browser != "none":
         _pq = quality in ("opusprem", "opusnative", "flac") or bool(
             _cfg_get("yt_music_browser_cookies", False))
         if _pq:
             opts["cookiesfrombrowser"] = (browser,)
-        # otherwise intentionally NOT attaching cookies — this keeps mass downloads
-        # (Spotify playlists, library sync, CSV batches) from silently using a
-        # flagged Firefox session and getting "Requested format is not available".
 
     if DEN_PATH and os.path.exists(DEN_PATH):
         opts["js_runtimes"] = {"deno": {"path": DEN_PATH}}
@@ -558,9 +577,23 @@ def download_one(title, url, save_path, dtype, quality, speed_limit,
             ]
 
         elif quality == "best":
+            # NOTE: FFmpegExtractAudio has no 'copy' codec — 'copy' made
+            # every 'best' download fail with postprocessor error. The
+            # format already selects opus; 'opus' + no quality = stream
+            # copy into .opus (no re-encode).
             opts["format"] = "bestaudio[acodec=opus]/bestaudio/best"
             opts["postprocessors"] = [
-                {"key": "FFmpegExtractAudio", "preferredcodec": "copy"},
+                {"key": "FFmpegExtractAudio", "preferredcodec": "opus"},
+                {"key": "FFmpegMetadata", "add_metadata": True},
+                {"key": "EmbedThumbnail"},
+            ]
+
+        elif quality == "m4a":
+            # Best M4A: AAC stream copy when the source is AAC (most YT
+            # music videos serve m4a/AAC audio) — re-encode otherwise.
+            opts["format"] = ("bestaudio[acodec=aac]/bestaudio/best")
+            opts["postprocessors"] = [
+                {"key": "FFmpegExtractAudio", "preferredcodec": "m4a"},
                 {"key": "FFmpegMetadata", "add_metadata": True},
                 {"key": "EmbedThumbnail"},
             ]
@@ -610,25 +643,31 @@ def download_one(title, url, save_path, dtype, quality, speed_limit,
                 except Exception:
                     _sz = 0
                 try:
-                    history_db.record(title, "", dtype, source, "ok", _sz)
+                    import history_db as _hdb0
+                    _hdb0.record(title, "", dtype, url, "ok", _sz)
                 except Exception:
                     pass
                 # TITANIUM: lyrics + cover art in background (never blocks)
                 try:
                     import titanium_enrich as _ten_n
+                    _apath = (_files[0] if _files else
+                              os.path.join(save_path, title.replace("/", "_")[:180]))
                     if _cfg_get("enhance_audio", False):
                         import mutagen as _mgx
                         try:
-                            _inf = _mgx.File(path)
+                            _inf = _mgx.File(_apath)
                             if _inf and _inf.info and getattr(_inf.info, "bitrate", 0) < 240000:
-                                _enhance_audio(path, 256, "opus")
+                                _enhance_audio(_apath, 256, "opus")
                         except Exception:
                             pass
                     if _cfg_get("normalize_loudness"):
-                        _ten_n.normalize_loudness(path)
+                        try:
+                            _ten_n.normalize_loudness(_apath)
+                        except Exception:
+                            pass
                     if _cfg_get("replaygain", False):
                         try:
-                            _ten_n.compute_replaygain(path)
+                            _ten_n.compute_replaygain(_apath)
                         except Exception:
                             pass
                 except Exception:
@@ -749,16 +788,18 @@ def download_one(title, url, save_path, dtype, quality, speed_limit,
                     time.sleep(120)
                     continue
                 if "page needs to be reloaded" in msg.lower():
-                    # YouTube bot/check — on the first couple of hits flip to the
-                    # embedded client (bypasses this gate), then back off.
+                    # YouTube bot/check — flip to the TV client: it
+                    # serves full audio formats WITHOUT a PO token.
+                    # (web_embedded was wrong for music: embedded players
+                    # get NO audio formats -> 'format not available'.)
                     if attempt == 0 or attempt == 1:
                         try:
                             _cur = current_opts.get("extractor_args", {}).get(
                                 "youtube", {})
                             _cur = dict(_cur)
-                            _cur["player_client"] = ["web_embedded"]
-                            current_opts.setdefault("extractor_args", {})["youtube"] = _cur
-                            report("↻ bot-check — switching to embedded client…")
+                            _cur["player_client"] = ["tv"]
+                            current_opts.setdefault("extractor_args", {})[ "youtube"] = _cur
+                            report("↻ bot-check — switching to TV client…")
                         except Exception:
                             pass
                     # pace hard so ongoing bulk jobs stay under the radar
@@ -766,6 +807,7 @@ def download_one(title, url, save_path, dtype, quality, speed_limit,
                     if attempt < 3:
                         continue
                     report(f"✗ blocked")
+                    _dbg("DL FAIL blocked url=%s err=%s" % (str(url)[:60], str(msg)[:120]))
                     return ("failed", msg[:150])
                 if "403" in msg and attempt < 3:
                     time.sleep(1)
@@ -813,7 +855,7 @@ def download_one(title, url, save_path, dtype, quality, speed_limit,
                 if "unavailable" in msg.lower():
                     # Don't trust "unavailable" on the first hit — it hides
                     # region-lock walls, age gates, PO-token checks, bot walls.
-                    # Try saved cookies + web_embedded client before believing it.
+                    # Try saved cookies + TV client before believing it.
                     _cff = _data_file(".peak_yt_cookies.txt")
                     _did_fallback = False
                     if not current_opts.get("cookiefile") and os.path.isfile(_cff):
@@ -823,9 +865,9 @@ def download_one(title, url, save_path, dtype, quality, speed_limit,
                         report("↻ unavailable — trying saved cookies…")
                     try:
                         _e = current_opts.get("extractor_args", {}).get("youtube", {}) or {}
-                        if _e.get("player_client") != ["web_embedded"]:
-                            _e = dict(_e); _e["player_client"] = ["web_embedded"]
-                            current_opts.setdefault("extractor_args", {})["youtube"] = _e
+                        if _e.get("player_client") != ["tv"]:
+                            _e = dict(_e); _e["player_client"] = ["tv"]
+                            current_opts.setdefault("extractor_args", {})[ "youtube"] = _e
                             _did_fallback = True
                     except Exception:
                         pass
@@ -833,11 +875,20 @@ def download_one(title, url, save_path, dtype, quality, speed_limit,
                         time.sleep(2 + attempt * 2)
                         continue
                     report(f"✗ video gone")
+                    _dbg("DL FAIL gone url=%s err=%s" % (str(url)[:60],
+                                                          str(msg)[:120]))
                     return ("failed", msg[:150])
                 if attempt >= 3:
+                    _dbg("DL FAIL generic url=%s err=%s" % (
+                        str(url)[:60], str(msg)[:120]))
                     report(f"✗ {msg[:40]}")
                     return ("failed", msg[:150])
                 time.sleep(1)
+    try:
+        _dbg("DL FAIL retries url=%s err=%s" % (str(url)[:60],
+                                                str(msg)[:120] if 'msg' in dir() else "?"))
+    except Exception:
+        pass
     return ("failed", "retries exhausted")
 
 
@@ -854,6 +905,17 @@ def _watch_url(vid, mode=None):
     if mode == "ytmusic":
         return "https://music.youtube.com/watch?v=" + vid
     return "https://www.youtube.com/watch?v=" + vid   # 'both' -> canonical
+
+
+def _dbg(m):
+    """One-line search/download trace for diagnosing frozen-exe issues."""
+    try:
+        import datetime as _dtt
+        with open(os.path.join(DATA_DIR, "search_debug.log"), "a",
+                  encoding="utf-8") as _f:
+            _f.write("%s %s\n" % (_dtt.datetime.now().strftime("%H:%M:%S"), m))
+    except Exception:
+        pass
 
 
 def search_youtube(query, n=8, browser=None, source=None,
@@ -901,19 +963,50 @@ def search_youtube(query, n=8, browser=None, source=None,
                                         _r["views"] = _e["view_count"]
                     except Exception:
                         pass
+                _dbg("innertube q=%r n=%d" % (query[:50], len(it)))
                 return it
-    except Exception:
-        pass
+        _dbg("innertube EMPTY q=%r" % query[:50])
+    except Exception as _ei:
+        _dbg("innertube EXC q=%r err=%s" % (query[:50], str(_ei)[:90]))
     if sm == "ytmusic":
         return []
     opts = {"quiet": True, "extract_flat": True, "skip_download": True,
             "no_warnings": True}
-    if browser and browser != "none":
+    _harvest = _data_file(".peak_yt_cookies.txt")
+    if os.path.isfile(_harvest) and os.path.getsize(_harvest) > 500:
+        opts["cookiefile"] = _harvest
+    elif browser and browser != "none":
         opts["cookiesfrombrowser"] = (browser,)
+    try:
+        _dbg("search q=%r cookiefile=%s mode=%s" % (
+            query[:60], bool(opts.get("cookiefile")), sm))
+    except Exception:
+        pass
     if DEN_PATH:
         opts["js_runtimes"] = {"deno": {"path": DEN_PATH}}
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(f"ytsearch{n}:{query}", download=False)
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(f"ytsearch{n}:{query}", download=False)
+    except Exception as _e:
+        _dbg("ytsearch FAILED q=%r err=%s" % (query[:50], str(_e)[:90]))
+        raise
+    entries = (info or {}).get("entries") or []
+    _dbg("ytsearch q=%r entries=%d" % (query[:50], len(entries)))
+    if not entries:
+        # ytsearch bot-walled: last resort = YT MUSIC search endpoint
+        # (different backend from plain ytsearch).
+        try:
+            with yt_dlp.YoutubeDL(dict(opts)) as _y2:
+                _i2 = _y2.extract_info(f"ytmusicsearch{n}:{query}",
+                                       download=False)
+            entries = (_i2 or {}).get("entries") or []
+            _dbg("ytmusicsearch q=%r entries=%d" % (query[:50],
+                                                    len(entries)))
+        except Exception as _e2:
+            _dbg("ytmusicsearch FAILED q=%r err=%s" % (
+                query[:50], str(_e2)[:90]))
+        if entries:
+            info = {"entries": entries}
     results = []
     for e in (info or {}).get("entries", []) or []:
         if not e:
@@ -1191,12 +1284,18 @@ def _loose_match(results, track, artist):
     return best
 
 
-def _match_track(track, artist, browser, prefs=None, n=8):
+def _match_track(track, artist, browser, prefs=None, n=8, dur_s=None):
     """One pipeline for every tab: search -> strict -> loose -> rescue query."""
     _src = (prefs or {}).get("source", None)
     _con = bool((prefs or {}).get("cap_on", True))
     _cmin = (prefs or {}).get("cap_min", 40)
     _cmax = (prefs or {}).get("cap_max", 720)
+    # Spotify CSV gives the REAL duration — tighten the window around it
+    # (+/-25%) to kill live/short covers when we know the target length.
+    if dur_s:
+        _cmin = max(15, int(dur_s * 0.75))
+        _cmax = int(dur_s * 1.25) + 15
+        _con = True
     q = (track + " " + artist).strip()
     try:
         results = search_youtube(q, n, browser, source=_src,
@@ -1210,7 +1309,9 @@ def _match_track(track, artist, browser, prefs=None, n=8):
             matched = _mt.strict_match(results, track, artist,
                                        caps_on=_con, cap_min_s=_cmin,
                                        cap_max_s=_cmax)
-        except Exception:
+        except Exception as _merr:
+            _dbg("MATCHER CRASH track=%r err=%s" % (str(track)[:30],
+                                                   str(_merr)[:100]))
             try:
                 matched = pick_best(results, artist=artist, title=track)
             except Exception:
@@ -1220,6 +1321,33 @@ def _match_track(track, artist, browser, prefs=None, n=8):
                 matched = _loose_match(results, track, artist)
             except Exception:
                 matched = None
+    # RESCUE 1: if the survivor is unofficial (reupload/lyric channel)
+    # or duration-less, try the targeted 'official audio' query once.
+    def _is_official(c):
+        if not isinstance(c, dict):
+            return False
+        ch = (c.get("channel") or "").strip().lower()
+        return ch in ("song", "video", "songs") or "topic" in ch or \
+               (artist and artist.lower() in ch)
+    if matched and (not _is_official(matched)
+                    or matched.get("seconds") is None):
+        try:
+            r3 = search_youtube(q + " official audio", n, browser,
+                                source=_src, cap_on=_con,
+                                cap_min=_cmin, cap_max=_cmax)
+            if r3:
+                try:
+                    import matchers as _mt3
+                    m3 = _mt3.strict_match(r3, track, artist,
+                                            caps_on=_con, cap_min_s=_cmin,
+                                            cap_max_s=_cmax)
+                except Exception:
+                    m3 = None
+                if m3 and _is_official(m3) and \
+                        (m3.get("seconds") or matched.get("seconds") is None):
+                    matched = m3
+        except Exception:
+            pass
     if not matched:
         try:
             _simple_t = re.sub(r"\s*\([^)]*\)\s*", " ", track)
@@ -1577,9 +1705,89 @@ class App:
         self._tab_enhance(nb)
         self._tab_lyricsync(nb)
         self._tab_settings(nb)
+        # deep-link: Shungite.exe --tab <index|name> opens on that tab
+        try:
+            _names = ["single", "playlist", "search", "batch", "spotify",
+                      "ytm", "stats", "enhance", "lyric", "settings"]
+            for _a in sys.argv[1:]:
+                if _a.lower().startswith("--tab="):
+                    _v = _a.split("=", 1)[1].strip().lower()
+                    _i = (_names.index(_v) if _v in _names
+                          else int(_v) if _v.isdigit() else 0)
+                    nb.select(_i)
+                    _dbg("deep-link tab -> %d (argv=%r)" % (_i, sys.argv[1:]))
+                    break
+        except Exception as _te:
+            try:
+                _dbg("deep-link FAILED: %s" % str(_te)[:90])
+            except Exception:
+                pass
 
         self._start_scheduler()
         self._check_update_async()
+        # frozen-env self-test: one real download at startup proves the
+        # whole chain (cookies/deno/formats) and logs the truth.
+        try:
+            import tempfile as _tf
+            import threading as _tth
+            _tstd = os.path.join(_tf.gettempdir(), "shungite_selftest")
+            os.makedirs(_tstd, exist_ok=True)
+            def _selftest():
+                try:
+                    import subprocess as _ssp
+                    import yt_dlp as _yd
+                    _dbg("SELFTEST yt-dlp=%s deno=%s jsruntimes=%s tmp=%s"
+                         % (getattr(_yd.version, "__version__", "?"),
+                            DEN_PATH, os.environ.get("JS_RUNTIMES"),
+                            _tf.gettempdir()))
+                    try:
+                        _pv = _ssp.run([DEN_PATH, "--version"],
+                                       capture_output=True, timeout=30)
+                        _dbg("SELFTEST deno rc=%s out=%s"
+                             % (_pv.returncode,
+                                (_pv.stdout or b"").decode("utf-8",
+                                                          "replace")[:40]))
+                    except Exception as _pe:
+                        _dbg("SELFTEST deno SPAWN FAILED: %s"
+                             % str(_pe)[:100])
+                    # verbose-traced download: every yt-dlp decision line
+                    # lands in search_debug.log (client selection, PO
+                    # token attempts, deno/JS runtime use, real error)
+                    class _L:
+                        def debug(self, m):
+                            _dbg("YTDBG %s" % str(m)[:200])
+                        def warning(self, m):
+                            _dbg("YTWARN %s" % str(m)[:200])
+                        def error(self, m):
+                            _dbg("YTERR %s" % str(m)[:200])
+                    _orig_ydl = _yd.YoutubeDL
+
+                    class _YDLWrap(_orig_ydl):
+                        def __init__(self, *a, **kw):
+                            if a and isinstance(a[0], dict):
+                                a = (dict(a[0]),) + a[1:]
+                                a[0].setdefault("verbose", True)
+                                a[0].setdefault("logger", _L())
+                            super().__init__(*a, **kw)
+                    _yd.YoutubeDL = _YDLWrap
+                    try:
+                        _st, _sr = download_one(
+                            "shungite_selftest",
+                            "https://www.youtube.com/watch?v=Vhh_GeBPOhs",
+                            _tstd, "audio", "opus256", 0,
+                            browser="firefox", cancel_event=None,
+                            cookiefile=None, subs=False)
+                    finally:
+                        _yd.YoutubeDL = _orig_ydl
+                    _dbg("SELFTEST %s :: %s" % (_st, str(_sr)[:100]))
+                except Exception as _se:
+                    _dbg("SELFTEST EXC %s" % str(_se)[:120])
+            _tth.Thread(target=_selftest, daemon=True).start()
+        except Exception as _ste:
+            try:
+                _dbg("SELFTEST START FAILED: %s" % str(_ste)[:100])
+            except Exception:
+                pass
 
         # phone remote: tiny LAN web UI on :8765
         self._remote_url = ""
@@ -1637,9 +1845,7 @@ class App:
         f.pack(fill="x", pady=4)
         tk.Label(f, text="Quality:", bg=BG2, fg=FG2, font=FONT).pack(side="left", padx=8)
         ttk.Combobox(f, values=[
-            "Opus 256k premium (best)", "Opus 256k (guaranteed)",
-            "Opus native (no re-encode)", "Best (no re-encode)",
-            "FLAC (lossless)", "MP3 320"],
+            "Best Opus", "Best M4A"],
             textvariable=var, state="readonly", width=28, font=FONT).pack(side="left")
 
     def _folder_row(self, parent, label="Save to:"):
@@ -1671,15 +1877,22 @@ class App:
             def _pump():
                 try:
                     while True:
-                        kind, a = self._gq.get_nowait()
+                        _msg = self._gq.get_nowait()
+                        # Messages arrive as (kind, text) or (kind, args).
+                        # Indexing a bare string gives only its first
+                        # character (bracket display bug) - normalize.
+                        kind = _msg[0]
+                        a = _msg[1]
+                        if isinstance(a, tuple):
+                            a = a[0] if a else ""
                         try:
                             if kind == "blog":
-                                self._blog.insert(tk.END, a[0] + "\n")
+                                self._blog.insert(tk.END, str(a) + "\n")
                                 self._blog.see(tk.END)
                             elif kind == "bstat":
-                                self._bstat.config(text=a[0])
+                                self._bstat.config(text=str(a))
                             elif kind == "status" and hasattr(self, "_status"):
-                                self._status.config(text=a[0])
+                                self._status.config(text=str(a))
                         except Exception:
                             pass
                         self._gq.task_done()
@@ -2164,7 +2377,9 @@ class App:
             try:
                 res = search_youtube(q, 10, self.browser())
             except Exception as e:
-                self._ui(lambda: self._sstat2.config(text=f"Search failed: {e}"))
+                _msg = str(e)[:80]
+                self._ui(lambda m=_msg: self._sstat2.config(
+                    text=f"Search failed: {m}"))
                 return
             self._sres = res
 
@@ -2428,8 +2643,9 @@ class App:
             try:
                 _write_csv(dur_map)
             except Exception as e:
-                self._ui(lambda: messagebox.showerror("Write failed",
-                                                      str(e)[:200]))
+                _msg = str(e)[:200]
+                self._ui(lambda m=_msg: messagebox.showerror("Write failed",
+                                                             m))
                 return
             _log(f"  ✅ wrote {len(track_list)} tracks -> "
                  f"{os.path.basename(out_csv)}")
@@ -2468,7 +2684,14 @@ class App:
         except Exception:
             pass
         try:
-            matched, results = _match_track(track, artist, browser, prefs)
+            _dur_s = None
+            try:
+                if durms and str(durms).strip().isdigit():
+                    _dur_s = int(durms) / 1000.0
+            except Exception:
+                _dur_s = None
+            matched, results = _match_track(track, artist, browser, prefs,
+                                            dur_s=_dur_s)
         except Exception as e:
             with lock:
                 stats["fail"] = stats.get("fail", 0) + 1
@@ -2821,7 +3044,7 @@ class App:
                  bg=BG2, fg="#6b6b6b", font=FONT_SM).pack(side="left", padx=10)
         self._spq = tk.StringVar(value="Best Opus")
         self._spfmt = tk.StringVar(value=self.cfg.get("fmt_spotify", "audio"))
-        fmtrow = tk.Frame(br if "br" in """self._quality_row(br, self._spq)""" else card, bg=BG2)
+        fmtrow = tk.Frame(br, bg=BG2)
         fmtrow.pack(side="left", padx=(10, 0))
         tk.Label(fmtrow, text="Format:", bg=BG2, fg=FG2, font=FONT).pack(side="left", padx=(0, 4))
         ttk.Combobox(fmtrow, values=["audio", "video"], textvariable=self._spfmt,
@@ -3192,9 +3415,10 @@ class App:
                 for name, rows in sp.home_sections(20):
                     sections.append((f"✨ {name}", rows))
             except Exception as e:
+                _msg = str(e)[:50]
                 if not oauth_pls:
-                    self._ui(lambda: self._spstat.config(
-                        text=f"● {str(e)[:50]}", fg="#e63946"))
+                    self._ui(lambda m=_msg: self._spstat.config(
+                        text=f"● {m}", fg="#e63946"))
                     return
 
             if not oauth_pls and spo:
@@ -4095,7 +4319,7 @@ class App:
                  bg=BG2, fg="#6b6b6b", font=FONT_SM).pack(side="left", padx=10)
         self._ytmq = tk.StringVar(value="Best Opus")
         self._ytmfmt = tk.StringVar(value=self.cfg.get("fmt_ytm", "audio"))
-        fmtrow = tk.Frame(br if "br" in """self._quality_row(br, self._ytmq)""" else card, bg=BG2)
+        fmtrow = tk.Frame(br, bg=BG2)
         fmtrow.pack(side="left", padx=(10, 0))
         tk.Label(fmtrow, text="Format:", bg=BG2, fg=FG2, font=FONT).pack(side="left", padx=(0, 4))
         ttk.Combobox(fmtrow, values=["audio", "video"], textvariable=self._ytmfmt,
@@ -4800,7 +5024,8 @@ class App:
                 self._notify_done("SHUNGITE",
                                   f"{len(res)} auto playlists generated")
             except Exception as e:
-                self._ui(lambda: self._enhstat.config(text="⚠ " + str(e)[:60]))
+                _msg = str(e)[:60]
+                self._ui(lambda m=_msg: self._enhstat.config(text="⚠ " + m))
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -4834,7 +5059,8 @@ class App:
                     text=f"● backfill done — {e} enriched of {d} scanned"))
                 self._notify_done("SHUNGITE", f"Backfill complete ({e})")
             except Exception as ex:
-                self._ui(lambda: self._enhstat.config(text="⚠ " + str(ex)[:60]))
+                _msg = str(ex)[:60]
+                self._ui(lambda m=_msg: self._enhstat.config(text="⚠ " + m))
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -5201,8 +5427,9 @@ class App:
                 self._notify_done("SHUNGITE",
                                   f"Embedded {lyr} lyrics, {cover} covers")
             except Exception as ex:
-                self._ui(lambda: self._enhstat.config(
-                    text="⚠ " + str(ex)[:60]))
+                _msg = str(ex)[:60]
+                self._ui(lambda m=_msg: self._enhstat.config(
+                    text="⚠ " + m))
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -6401,6 +6628,11 @@ class App:
                     self._ls_status.config(
                         text=f"[{done+1}/{total}] {name}")
                     try:
+                        try:
+                            import torch as _torch
+                            _gpu = _torch.cuda.is_available()
+                        except Exception:
+                            _gpu = False
                         p_ = subprocess.Popen(
                             [py, "-m", "whisperx", f,
                              "--model", model,
@@ -7723,13 +7955,15 @@ class App:
                         text="YouTube logged in (%s cookies) - 256k ready" % n,
                         fg="#1DB954"))
                 except Exception as e2:
-                    self._ui(lambda: self._loginstat.config(
-                        text="login done (cookie harvest skipped: %s)" % str(e2)[:40],
+                    _msg2 = str(e2)[:40]
+                    self._ui(lambda m=_msg2: self._loginstat.config(
+                        text="login done (cookie harvest skipped: %s)" % m,
                         fg=GOLD))
                 self.root.after(1000, self._check_logins)
             except Exception as e:
-                self._ui(lambda: self._loginstat.config(
-                    text="error: " + str(e)[:50], fg="#e63946"))
+                _msg = str(e)[:50]
+                self._ui(lambda m=_msg: self._loginstat.config(
+                    text="error: " + m, fg="#e63946"))
 
         _th.Thread(target=run, daemon=True).start()
 

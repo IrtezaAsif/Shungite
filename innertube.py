@@ -4,6 +4,7 @@ Uses the same public API the YouTube Music web app / NewPipe use.
 Returns real artist names + videoIds. Falls back gracefully on any error.
 """
 import json
+import os
 import urllib.request
 
 API = ("https://music.youtube.com/youtubei/v1/search"
@@ -38,9 +39,44 @@ def search_music(query, limit=10):
     try:
         req = urllib.request.Request(
             API, data=json.dumps(body).encode(), headers=HDRS)
-        with urllib.request.urlopen(req, timeout=12) as r:
-            data = json.load(r)
-    except Exception:
+        # frozen-exe fix: PyInstaller builds can miss CA certs -> SSL
+        # verify fails -> every request dies silently. Build an explicit
+        # SSL context: certifi if present, else system store, else
+        # unverified (search is public data, acceptable last resort).
+        _ctx = None
+        try:
+            import ssl
+            try:
+                import certifi
+                _ctx = ssl.create_default_context(
+                    cafile=certifi.where())
+            except ImportError:
+                _ctx = ssl.create_default_context()
+        except Exception:
+            _ctx = None
+        if _ctx is not None:
+            try:
+                _ctx.check_hostname = True
+            except Exception:
+                pass
+            with urllib.request.urlopen(req, timeout=12,
+                                        context=_ctx) as r:
+                data = json.load(r)
+        else:
+            with urllib.request.urlopen(req, timeout=12) as r:
+                data = json.load(r)
+    except Exception as _e:
+        try:
+            _lf = os.path.join(os.path.expandvars(
+                r"%LOCALAPPDATA%\Shungite"), "search_debug.log")
+            # LocalLow actually lives under AppData\LocalLow
+            _lf = os.path.join(os.path.expanduser("~"),
+                               "AppData", "LocalLow", "Shungite",
+                               "search_debug.log")
+            with open(_lf, "a", encoding="utf-8") as _f:
+                _f.write("innertube EXC detail: %s\n" % str(_e)[:150])
+        except Exception:
+            pass
         return []
 
     out = []

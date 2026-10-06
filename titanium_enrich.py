@@ -146,7 +146,8 @@ def fetch_lyrics(artist, title, audio_path, duration_s=None):
                         urllib.parse.urlencode({"track_name": t,
                                                 "q": f"{artist} {title}"}))
         if isinstance(d2, list) and d2:
-            d = _pick_best_record(d2, lyric_lang()) or d2[0]
+            d = _pick_best_record(d2, lyric_lang() or
+                         _detect_lang_from_title(title, artist)) or d2[0]
     if not d:
         return False
     text = d.get("syncedLyrics") or d.get("plainLyrics")
@@ -935,6 +936,33 @@ def set_lyric_lang(lang):
     except Exception:
         pass
 
+
+
+def _detect_lang_from_title(title, artist=""):
+    """Infer the lyric language from the writing script of the title."""
+    t = f"{title} {artist}"
+    import unicodedata as _u
+    scripts = set()
+    for ch in t:
+        o = ord(ch)
+        if 0x3040 <= o <= 0x30FF:
+            scripts.add("ja")          # hiragana/katakana
+        elif 0xAC00 <= o <= 0xD7AF:
+            scripts.add("ko")          # hangul syllables
+        elif 0x4E00 <= o <= 0x9FFF:
+            scripts.add("cjk")         # han (ja or zh)
+        elif 0x0400 <= o <= 0x04FF:
+            scripts.add("ru")          # cyrillic
+    if "ja" in scripts:
+        return "ja"
+    if "ko" in scripts:
+        return "ko"
+    if "cjk" in scripts:
+        return "ja"                    # anime/j-pop default; zh tracks on
+                                       # YouTube are rare in this library
+    if "ru" in scripts:
+        return "ru"
+    return ""
 
 def _pick_best_record(recs, want_lang=""):
     """Choose the best lrclib record: prefer synced + preferred language."""

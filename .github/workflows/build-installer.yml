@@ -1,0 +1,95 @@
+# SHUNGITE — GitHub Actions: build exe + compile Inno Setup installer,
+# attach to a GitHub Release when a tag (v*) is pushed.
+name: Build Installer
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Download ffmpeg (for bundling)
+        shell: pwsh
+        run: |
+          $url = 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip'
+          Invoke-WebRequest -Uri $url -OutFile ffmpeg.zip
+          Expand-Archive ffmpeg.zip -DestinationPath ff
+          $bin = Get-ChildItem -Path ff -Recurse -Filter ffmpeg.exe | Select-Object -First 1
+          $probe = Get-ChildItem -Path ff -Recurse -Filter ffprobe.exe | Select-Object -First 1
+          New-Item -ItemType Directory -Force -Path ffmpeg | Out-Null
+          Copy-Item $bin.FullName ffmpeg\ffmpeg.exe
+          Copy-Item $probe.FullName ffmpeg\ffprobe.exe
+          Write-Host "ffmpeg staged"
+
+      - name: Build Shungite.exe (PyInstaller onedir)
+        run: |
+          python -m PyInstaller PEAK_GITHUB_true.spec --noconfirm --clean --distpath dist3 --workpath build3\b
+          Get-ChildItem dist3\Shungite
+
+      - name: Install Inno Setup 6
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          $iscc = 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path $iscc)) { throw 'ISCC.exe not found after install' }
+          Write-Host "ISCC at $iscc"
+
+      - name: Stage installer support files
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path installer | Out-Null
+          # LICENSE.rtf for the wizard's license page (plain-text fallback)
+          $license = Get-Content LICENSE -Raw
+          $rtf = '{\rtf1\ansi ' + ($license -replace '\\', '\\\\' -replace '\{', '\{' -replace '\}', '\}') + '\par}'
+          Set-Content -Path installer\LICENSE.rtf -Value $rtf -Encoding ASCII
+          # placeholder icon if none committed
+          if (-not (Test-Path 'installer\shungite.ico')) {
+            Copy-Item 'C:\Windows\System32\shell32.dll' $env:TEMP\shell32.dll
+            python -c "import struct,sys; d=open(r'$env:TEMP\shell32.dll','rb').read(); open('installer\shungite.ico','wb').write(d[:1])" 2>$null
+            if (-not (Test-Path 'installer\shungite.ico')) {
+              # minimal valid 1x1 32bpp .ico
+              $ico = [byte[]](0,0,1,0,1,0,1,1,0,0,1,0,32,0,0,0,0,0,28,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+              [System.IO.File]::WriteAllBytes('installer\shungite.ico', $ico)
+            }
+          }
+
+      - name: Compile installer (ISCC)
+        shell: pwsh
+        run: |
+          & 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' 'installer\Shungite.iss'
+          Get-ChildItem dist
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Shungite-installer
+          path: dist/*.exe
+
+      - name: Attach to GitHub Release (on tag)
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = "${env:GITHUB_REF}" -replace 'refs/tags/', ''
+          $setup = Get-ChildItem dist -Filter *.exe | Select-Object -First 1
+          gh release create $tag $setup.FullName --title "Shungite $tag" --generate-notes --repo IrtezaAsif/Shungite

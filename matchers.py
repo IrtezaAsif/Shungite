@@ -35,6 +35,20 @@ BAD_WORDS = ("karaoke", "nightcore", "8d", "8-d", "sped up", "slowed",
              "lofi girl", "radio", "lyric video", "lyrics", "8 bit",
              "cover version", "tribute to")
 
+# instant disqualification — never acceptable unless the QUERY itself asks
+# for one of these (user searched "nightcore x" -> keep nightcore results)
+HARD_DQ = ("slowed", "sped up", "nightcore", "8d", "8-d", "karaoke",
+           "reverb", "mashup", "fan made", "amv", "cover version",
+           "reaction", "tribute", "snippet", "teaser",
+           "full english", "english ver", "english opening",
+           "english cover", "dolby", "binaural", "立体音響",
+           "live from", "live at", "live performance", "concert",
+           "live version", "arena live", "the first take",
+           "lirik", "terjemahan", "sub espa", "sub español",
+           "lyrics", "lyric", "extended", "best part",
+           "remix", "feat lilypichu", "cover", "romaji",
+           "op cover", "full opening cover", "covered by")
+
 
 def _norm(s):
     s = unicodedata.normalize("NFKD", (s or "").lower())
@@ -135,7 +149,8 @@ def strict_match(candidates, title, artist, target_seconds=None,
         # (b) CJK ARTIST appears verbatim in candidate title/channel — the
         # uploader named the artist, so it's the right song even when the
         # title itself is romanized.
-        if q_tokens and not (q_tokens & t_tokens):
+        if q_tokens and not (q_tokens & t_tokens) and \
+                _ratio(q_t, t_norm) < 70:
             _t_cjk_ok = (_CJK_RE.search(title)
                          and _cjk_sim(title, c.title) >= 0.5)
             _a_cjk_ok = (_CJK_RE.search(artist)
@@ -143,9 +158,33 @@ def strict_match(candidates, title, artist, target_seconds=None,
                          >= 0.6)
             if not (_t_cjk_ok or _a_cjk_ok):
                 continue
+        ch_norm = _norm(c.channel)
+        _official = ((q_a and q_a in ch_norm) or "topic" in ch_norm
+                     or ch_norm in ("song", "video", "songs"))
         if caps_on and c.seconds is not None:
             if c.seconds < cap_min_s or c.seconds > cap_max_s:
                 continue
+        elif caps_on and c.seconds is None and not _official:
+            continue  # unknown duration + unofficial = can't trust
+        # hard-DQ: uploads that re-post the song in altered form — the
+        # "(slowed down)" / "sped up" / nightcore plague. Unless the user's
+        # own query contains the word, these are NEVER the right pick.
+        t_norm = _norm(c.title)
+        if any(w in t_norm for w in HARD_DQ if w not in q_full):
+            continue
+        if re.search(r"\blive\b", t_norm) and "live" not in q_full:
+            continue
+        # ultra-short titles (e.g. "0", "G})", the token gate is vacuous —
+        # demand the channel look official or contain the artist
+        if len(q_t) <= 3 and q_a:
+            ch_low = _norm(c.channel + " " + c.title)
+            if q_a not in ch_low and _norm(c.channel) not in ("song", "video", "songs", "topic"):
+                continue
+        # junk CHANNELS: lyric-translation reuploads etc.
+        ch_norm = _norm(c.channel)
+        for w in ("lirik", "terjemahan", "lyrics in", "letra", "traducida"):
+            if w in ch_norm and w not in q_full:
+                c.score -= 0.35
         clean.append(c)
     if not clean:
         return (None, []) if return_all else None
@@ -193,7 +232,14 @@ def strict_match(candidates, title, artist, target_seconds=None,
         # official/topic boost
         ch = _norm(c.channel)
         if (q_a and (q_a in ch)) or "topic" in ch:
-            c.score += 0.08
+            c.score += 0.35
+        # YT Music auto-channels: 'Song' = official audio (strongest
+        # original-upload signal). 'Video' is mixed (official MVs AND
+        # reuploads) — smaller boost only.
+        if ch == "song":
+            c.score += 0.55
+        elif ch in ("video", "songs"):
+            c.score += 0.10
 
     clean.sort(key=lambda c: -c.score)
     best = clean[0]

@@ -1,12 +1,14 @@
-# Runtime dependencies (get bundled INTO PEAK.exe)
+# Runtime dependencies (bundled INTO Shungite.exe by PyInstaller)
 yt-dlp
-pandas
 mutagen
+pandas
+pytz            # pandas timezone dep (missing = CSV import fails)
 openpyxl        # pandas needs this to read .xlsx files (Exportify Excel exports)
+pywebview>=5.0  # embedded WebView2 YouTube login window
+pythonnet       # pywebview Windows backend (clr_loader ships with it)
+rapidfuzz>=3.0  # fuzzy title matching in matchers.py
+tqdm>=4.65
 
 # Build-time only (used to DO the packaging, not bundled)
 pyinstaller
-pyinstaller-hooks-contrib   # ships the pandas/etc. PyInstaller hooks that make this work smoothly
-pywebview>=5.0
-rapidfuzz>=3.0
-tqdm>=4.65
+pyinstaller-hooks-contrib   # pandas/PyInstaller hooks

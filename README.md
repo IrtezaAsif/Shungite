@@ -16,6 +16,8 @@ link written into the file itself.*
 **⬇ [Download the installer from Releases](https://github.com/IrtezaAsif/Shungite/releases)**
 — setup wizard · desktop shortcut · uninstaller · zero console windows
 
+💬 **[Join the Discord](https://discord.gg/whczzt5VS7)** — support, bug reports, feature requests, showcase
+
 </div>
 
 ---

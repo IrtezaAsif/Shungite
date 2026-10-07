@@ -1789,13 +1789,17 @@ class App:
             except Exception:
                 pass
 
-        # phone remote: tiny LAN web UI on :8765
+        # phone remote: local web UI on :8765 (SECURE: loopback by
+        # default; LAN only if the user opted in; PIN-paired).
         self._remote_url = ""
+        self._remote_pin = ""
         try:
             if web_remote and self.cfg.get("web_remote", True):
                 web_remote._State.app = self
-                _srv, _addr = web_remote.start_server(8765)
+                _expose = bool(self.cfg.get("web_remote_lan", False))
+                _srv, _addr = web_remote.start_server(8765, expose=_expose)
                 self._remote_url = _addr
+                self._remote_pin = web_remote.new_pin() if _expose else ""
         except Exception:
             pass
 
@@ -7023,11 +7027,23 @@ class App:
                        activebackground=BG2).pack(anchor="w", padx=8)
 
         if getattr(self, "_remote_url", ""):
+            _mode = "LAN (paired)" if self.cfg.get("web_remote_lan") \
+                else "this PC only (127.0.0.1)"
             tk.Label(card,
-                     text=f"📱 Phone remote: {self._remote_url}  "
-                          "(same Wi-Fi, open in phone browser)",
+                     text=f"📱 Phone remote: {self._remote_url}  ({_mode})",
                      bg=BG2, fg="#22c55e", font=FONT_SM).pack(
                 anchor="w", pady=(8, 0))
+            if getattr(self, "_remote_pin", ""):
+                tk.Label(card,
+                         text=f"   Pairing PIN: {self._remote_pin} "
+                              "(valid 5 min, one-time use)",
+                         bg=BG2, fg="#fbbf24", font=FONT_B).pack(
+                    anchor="w", pady=(2, 0))
+            tk.Label(card,
+                     text="   Remote is PIN-protected; unsafe LAN "
+                          "exposure is off by default.",
+                     bg=BG2, fg="#6b6b6b", font=FONT_SM).pack(
+                anchor="w", pady=(2, 0))
         rr = tk.Frame(card, bg=BG2)
         rr.pack(fill="x", pady=(12, 4))
         self._btn(rr, "↺ Reset settings to defaults", self._reset_settings,

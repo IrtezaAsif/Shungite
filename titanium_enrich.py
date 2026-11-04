@@ -313,6 +313,40 @@ def vtt_to_lrc(vtt_path, lrc_path):
         return False
 
 
+def rank_vtt_candidates(paths, want_lang=""):
+    """Rank downloaded .vtt subtitle files for lyric conversion.
+
+    The song's OWN language first (the video's native captions), original
+    'und' next, any other non-English track after that, and English
+    translations DEAD LAST — an English translation of a Japanese song is
+    the wrong lyrics, never a preferred pick. Language is parsed from the
+    filename tag ('stem.ja.vtt', 'stem.en-US.vtt'), never from length."""
+    import os as _os
+
+    def _lang_of(p):
+        stem = _os.path.splitext(p)[0]          # strip .vtt
+        return _os.path.splitext(stem)[1].lstrip(".").lower() or "und"
+
+    def _score(p):
+        lg = _lang_of(p)
+        en = lg in ("en", "en-us", "en-gb")
+        if not want_lang:
+            if en:
+                return 0
+            return 2 if lg == "und" else 1
+        if lg == want_lang:
+            return 5
+        if want_lang and lg.startswith(want_lang):
+            return 4
+        if lg in ("und", "orig"):
+            return 3
+        if en:
+            return 0
+        return 1
+
+    return sorted(paths, key=lambda p: (-_score(p), len(p)))
+
+
 def fetch_lyrics_any(artist, title, audio_path, yt_url="", yt_query="", duration_s=None):
     """lrclib synced/plain -> YouTube description."""
     if fetch_lyrics(artist, title, audio_path, duration_s=duration_s):

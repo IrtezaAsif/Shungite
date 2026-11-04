@@ -168,9 +168,14 @@ def strict_match(candidates, title, artist, target_seconds=None,
             continue  # unknown duration + unofficial = can't trust
         # hard-DQ: uploads that re-post the song in altered form — the
         # "(slowed down)" / "sped up" / nightcore plague. Unless the user's
-        # own query contains the word, these are NEVER the right pick.
+        # own query contains the junk concept, these are NEVER the right
+        # pick. Phrase containment alone is too strict: a query "x live"
+        # must not disqualify "x (Live from LA)" just because the DQ phrase
+        # is "live from" — suppress on TOKEN overlap instead.
         t_norm = _norm(c.title)
-        if any(w in t_norm for w in HARD_DQ if w not in q_full):
+        _q_toks = set(q_full.split())
+        if any(w in t_norm and not (set(w.split()) & _q_toks)
+               for w in HARD_DQ):
             continue
         if re.search(r"\blive\b", t_norm) and "live" not in q_full:
             continue

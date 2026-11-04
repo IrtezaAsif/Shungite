@@ -198,6 +198,178 @@ def save_config(cfg):
         pass
 
 
+# ── Naming + config heal + URL metadata (2026-11 fix session) ────────────────
+
+def want_filename(track, artist=""):
+    """Canonical download filename stem: **Song - Artist** (user decision
+    2026-11-04). Legacy 'Artist - Song' files stay readable on disk — the
+    read side (_check_have/_have_track) matches BOTH orders."""
+    _bad = r'[<>:"/\\|?*]'
+    t = re.sub(_bad, "_", str(track or "")).strip(" .")
+    a = re.sub(_bad, "_", str(artist or "")).strip(" .")
+    stem = ("%s - %s" % (t, a)) if (t and a) else (t or a)
+    return stem.strip(" .")[:200]
+
+
+_NAMING_FLIP_TS = time.mktime((2026, 11, 5, 0, 0, 0, 0, 0, -1))
+"""Downloads on/after this date use 'Song - Artist' filenames (user call);
+older files are 'Artist - Song'. Used ONLY for unindexed files in
+_load_lib_index: files made earlier TODAY by the old build are legacy-order
+(the drill proved it), and new-build downloads always write _index.txt so
+they never reach this parse. Anchor = midnight tonight, not now."""
+
+
+def looks_like_url(s):
+    """True if s is a URL — a URL must NEVER become a filename (the old
+    Single tab passed the link itself as the download title)."""
+    s = (s or "").strip().lower()
+    return (s.startswith(("http://", "https://", "www."))
+            or "youtu.be/" in s)
+
+
+def heal_cookie_paths(cfg, save=True):
+    """Clear folder-shaped / missing cookie-file config keys (sp + yt) and
+    migrate the dead legacy 'manual_sp_dc' key into the api-layer cache
+    (spotify_api.SP_DC_PATH) exactly once. Returns the list of actions.
+    Eager counterpart of the lazy _yt_cookiefile() heal. NEVER logs values."""
+    changed = []
+    for key in ("sp_cookies_file", "yt_cookies_file"):
+        p = (cfg.get(key) or "").strip()
+        if p and not (os.path.isfile(p) and os.path.getsize(p) > 100):
+            cfg[key] = ""
+            changed.append(key)
+    dc = (cfg.get("manual_sp_dc") or "").strip()
+    if dc:
+        try:
+            _sp_path = sp.SP_DC_PATH   # dynamic: tests monkeypatch this
+            if not os.path.exists(_sp_path) or os.path.getsize(_sp_path) < 50:
+                with open(_sp_path, "w", encoding="utf-8") as f:
+                    f.write(dc)
+                changed.append("manual_sp_dc->peak_sp_dc")
+            else:
+                changed.append("manual_sp_dc-dropped(existing-dc)")
+            cfg.pop("manual_sp_dc", None)
+        except Exception:
+            pass
+    if changed and save:
+        save_config(cfg)
+    return changed
+
+
+def _native_sub_langs(title, meta_artist=""):
+    """yt-dlp subtitleslangs order: the video's OWN native subs FIRST,
+    English translations DEAD LAST -- a Japanese song must get Japanese
+    lyrics, never the translation. The user's subtitle_lang setting
+    overrides everything."""
+    user = _cfg_get("subtitle_lang")
+    if user:
+        return [user]
+    det = ""
+    try:
+        from titanium_enrich import _detect_lang_from_title as _dlt
+        det = _dlt(title or "", meta_artist or "")
+    except Exception:
+        det = ""
+    return (["und"] + ([det] if det and det != "en" else [])
+            + ["en.*", "en"])
+
+
+_SEG_DESCRIPTOR_RE = re.compile(
+    r"^(official\s+(video|audio|music\s+video)|music\s+video|lyric\s+video|"
+    r"lyrics?(\s+video)?|mv|audio|visualizer|(hd|4k)(\s*(video|mv))?)$", re.I)
+
+
+def _split_video_title(vtitle, uploader=""):
+    """'Artist - Song (Official Video)' -> (song, artist) for URL downloads.
+    Falls back to (cleaned title, uploader). Strips decoration brackets and
+    the auto-generated ' - Topic' channel suffix. A trailing DESCRIPTOR
+    segment ('Song Name - Official Video') is not an artist: the whole
+    cleaned title stays the song and the uploader supplies the artist."""
+    t = str(vtitle or "")
+    t = re.sub(r"\((?:[^()]*(?:official|video|audio|mv|lyric|hd|4k)[^()]*)\)",
+               " ", t, flags=re.I)
+    t = re.sub(r"【[^】]*】", " ", t)
+    t = re.sub(r"\s+", " ", t).strip(" -|")
+    a = (uploader or "").strip()
+    if a.lower().endswith(" - topic"):
+        a = a[:-8].strip()
+    parts = [p.strip() for p in t.split(" - ") if p.strip()]
+    if len(parts) >= 2 and _SEG_DESCRIPTOR_RE.match(parts[-1]):
+        t = " - ".join(parts[:-1])
+    if " - " in t:
+        left, right = t.split(" - ", 1)
+        left, right = left.strip(), right.strip()
+        if left and right:
+            return right, left          # video titles are 'Artist - Song'
+    return (t or str(vtitle or "")).strip(), a
+
+
+def _resolve_url_meta(url):
+    """(title, uploader, video_id) for a YouTube URL — cheap no-download
+    probe. Returns ('', '', None) on any failure; callers then let yt-dlp
+    name the file from the video's own title (NEVER from the URL)."""
+    try:
+        o = {"quiet": True, "no_warnings": True, "skip_download": True,
+             "noplaylist": True, "socket_timeout": 25, "retries": 2}
+        _cf = _data_file(".peak_yt_cookies.txt")
+        if os.path.isfile(_cf) and os.path.getsize(_cf) > 500:
+            o["cookiefile"] = _cf
+        if DEN_PATH:
+            o["js_runtimes"] = {"deno": {"path": DEN_PATH}}
+        with yt_dlp.YoutubeDL(o) as y:
+            info = y.extract_info(url, download=False)
+        if not info:
+            return "", "", None
+        if info.get("entries") is not None:
+            info = next((e for e in info["entries"] if e), {}) or {}
+        _dbg("urlmeta %s title=%r up=%r" % (
+            str(info.get("id"))[:11], str(info.get("title"))[:40],
+            str(info.get("uploader"))[:24]))
+        return (info.get("title") or "", info.get("uploader")
+                or info.get("channel") or "", info.get("id"))
+    except Exception as _e:
+        _dbg("urlmeta FAILED %s err=%s" % (str(url)[:40], str(_e)[:80]))
+        return "", "", None
+
+
+def _parse_spotify_history_zip(zip_path):
+    """Unique (track, artist) pairs from a Spotify account-data export —
+    accepts the .zip OR the extracted folder. Drops podcast episodes and
+    blank names; preserves the JSON's own names verbatim (these flow into
+    the batch CSV's Track Name / Artist Name(s) columns)."""
+    import zipfile as _zf
+    import json as _j
+    out = {}   # ordered dedup: the CSV must mirror the JSON's own order
+
+    def _feed(name, fp):
+        if not (name.endswith(".json")
+                and "Streaming_History_Audio" in name):
+            return
+        for rec in _j.loads(fp.read()):
+            name_t = rec.get("master_metadata_track_name")
+            art = rec.get("master_metadata_album_artist_name") or ""
+            if name_t and str(name_t).strip():
+                out[(str(name_t).strip(), str(art).strip())] = True
+
+    if os.path.isdir(zip_path):
+        for _root, _dirs, files in os.walk(zip_path):
+            for fn in files:
+                p = os.path.join(_root, fn)
+                try:
+                    with open(p, "rb") as fh:
+                        _feed(fn, fh)
+                except Exception:
+                    pass
+    else:
+        with _zf.ZipFile(zip_path) as z:
+            for n in z.namelist():
+                try:
+                    _feed(n, z.open(n))
+                except Exception:
+                    pass
+    return list(out)
+
+
 # Module-level config accessor. `download_one` is a module-level function (no
 # `self`), so it can't reach App.cfg directly. App.__init__ binds _APP_CFG to its
 # loaded config; standalone callers fall back to load_config().
@@ -391,7 +563,7 @@ def download_one(title, url, save_path, dtype, quality, speed_limit,
     # outtmpl: use the cleaned (Artist - Title) name when the caller gave us
     # one so downloads land with the right filename even if yt-dlp's own
     # metadata title is messy (mixes, romaji, cover vids).
-    if title and isinstance(title, str):
+    if title and isinstance(title, str) and not looks_like_url(title):
         outtmpl = os.path.join(save_path, title + ".%(ext)s")
     else:
         outtmpl = os.path.join(save_path, "%(title)s.%(ext)s")
@@ -438,8 +610,7 @@ def download_one(title, url, save_path, dtype, quality, speed_limit,
     # subtitles ('und' = the video's own language) plus en variants.
     if subs or _cfg_get("download_subtitles"):
         opts["writesubtitles"] = True
-        _sl = [_cfg_get("subtitle_lang")] if _cfg_get("subtitle_lang") else ["en.*", "en", "und"]
-        opts["subtitleslangs"] = _sl
+        opts["subtitleslangs"] = _native_sub_langs(title, meta_artist)
         opts["writeautomaticsub"] = True
     prx = (_cfg_get("proxy", "") or "").strip()
     if prx:
@@ -619,9 +790,9 @@ def download_one(title, url, save_path, dtype, quality, speed_limit,
 
         current_opts = dict(opts)
         if subs:
+            # keep the native-first list computed above; the retry path must
+            # NOT stomp subtitleslangs back to English (2026-11 fix)
             current_opts["writesubtitles"] = True
-            current_opts["subtitleslangs"] = ["en", "en-US", "en-GB"]
-            current_opts["writeautomaticsub"] = False
 
         for attempt in range(4):
             try:
@@ -721,16 +892,18 @@ def download_one(title, url, save_path, dtype, quality, speed_limit,
                                 # if a .vtt landed next to the audio, convert it
                                 # into a .lrc (properly timed original-language
                                 # lyrics) BEFORE falling back to lrclib/genius
-                                _vtt = base + ".en-US.vtt"
                                 try:
-                                    from titanium_enrich import vtt_to_lrc
+                                    from titanium_enrich import (
+                                        vtt_to_lrc, rank_vtt_candidates,
+                                        lyric_lang, _detect_lang_from_title)
                                     if not os.path.exists(base + ".lrc"):
-                                        for lang_pref in (".en-US.vtt", ".en.vtt",
-                                                         ".und.vtt", ".vtt"):
-                                            _cand = base + lang_pref
-                                            if os.path.exists(_cand):
-                                                if vtt_to_lrc(_cand, base + ".lrc"):
-                                                    break
+                                        _vtts = _g2.glob(base + "*.vtt")
+                                        _wl = lyric_lang() or \
+                                            _detect_lang_from_title(title or "")
+                                        for _cand in rank_vtt_candidates(
+                                                _vtts, _wl):
+                                            if vtt_to_lrc(_cand, base + ".lrc"):
+                                                break
                                 except Exception:
                                     pass
                                 need = (not os.path.exists(base + ".lrc")
@@ -1408,10 +1581,11 @@ def _post_download_fixups(music, want_fn, track, artist, res_title="",
     try:
         if not os.path.exists(_base + ".lrc"):
             import glob as _gl
-            from titanium_enrich import vtt_to_lrc
-            _vtts = sorted(_gl.glob(_gl.escape(_base) + "*.vtt"),
-                           key=lambda x: len(x))
-            for _cand in _vtts:
+            from titanium_enrich import (vtt_to_lrc, rank_vtt_candidates,
+                                         lyric_lang, _detect_lang_from_title)
+            _vtts = _gl.glob(_gl.escape(_base) + "*.vtt")
+            _wl = lyric_lang() or _detect_lang_from_title(track, artist)
+            for _cand in rank_vtt_candidates(_vtts, _wl):
                 if vtt_to_lrc(_cand, _base + ".lrc"):
                     break
     except Exception:
@@ -1480,6 +1654,10 @@ class App:
     def __init__(self, root):
         self.root = root
         self.cfg = load_config()
+        try:
+            heal_cookie_paths(self.cfg)   # eager heal: folder paths cleared once
+        except Exception:
+            pass
         global _APP_CFG
         _APP_CFG = self.cfg
         self._gq = None
@@ -1627,7 +1805,12 @@ class App:
         """If the user picked a Spotify cookies.txt in Settings, extract its
         sp_dc into the api-layer cache so all Spotify calls use it."""
         p = (self.cfg.get("sp_cookies_file") or "").strip()
-        if not p or not os.path.exists(p):
+        if p and not (os.path.isfile(p) and os.path.getsize(p) > 100):
+            _dbg("sp_cookies_file invalid (%s) - clearing config key" %
+                 ("directory" if os.path.isdir(p) else "missing/small"))
+            heal_cookie_paths(self.cfg)
+            return False
+        if not p:
             return False
         try:
             dc = None
@@ -1694,6 +1877,7 @@ class App:
 
     def _notebook(self):
         nb = ttk.Notebook(self.root)
+        self._nb = nb          # stored for per-tab progress routing (_pump)
         nb.pack(fill="both", expand=True, padx=8, pady=(0, 4))
         self._tab_single(nb)
         self._tab_playlist(nb)
@@ -1868,6 +2052,53 @@ class App:
                   font=FONT, relief="flat", padx=10, cursor="hand2").pack(side="left")
         return e
 
+    def _file_row(self, parent, label=""):
+        """Entry + FILE picker (cookies.txt exports). The old folder picker
+        wired to these rows let a DIRECTORY poison the cookie settings."""
+        f = tk.Frame(parent, bg=BG2)
+        f.pack(fill="x", pady=4)
+        if label:
+            tk.Label(f, text=label, bg=BG2, fg=FG2, font=FONT).pack(
+                side="left", padx=8)
+        e = tk.Entry(f, bg=BG3, fg=FG, font=FONT, relief="flat")
+        e.pack(side="left", fill="x", expand=True, ipady=5, padx=4)
+        def browse():
+            from tkinter.filedialog import askopenfilename
+            d = askopenfilename(
+                title="Pick a cookies.txt (Netscape export)",
+                filetypes=[("cookies.txt", "*.txt"), ("All files", "*.*")])
+            if d:
+                e.delete(0, tk.END)
+                e.insert(0, d)
+        tk.Button(f, text="Browse", command=browse, bg=BG3, fg=FG,
+                  font=FONT, relief="flat", padx=10, cursor="hand2").pack(side="left")
+        return e
+
+    def _add_tab_progress(self, nb, tab_frame):
+        """Per-tab download progress bar + label (parity with Spotify/YTM).
+        Registered under the tab's notebook index; driven by _pump()."""
+        try:
+            idx = nb.index(tab_frame)
+        except Exception:
+            return None
+        wrap = tk.Frame(tab_frame, bg=BG2)
+        wrap.pack(fill="x", padx=8, pady=(0, 2))
+        pb = ttk.Progressbar(wrap, mode="determinate", maximum=100)
+        pb.pack(fill="x")
+        lbl = tk.Label(wrap, text="", bg=BG2, fg=FG2, font=FONT_SM)
+        lbl.pack(anchor="w")
+        if not hasattr(self, "_tab_bars"):
+            self._tab_bars = {}
+        self._tab_bars[idx] = (pb, lbl)
+        return pb
+
+    def _pb_for_active_tab(self):
+        try:
+            idx = self._nb.index(self._nb.select())
+        except Exception:
+            return None
+        return (getattr(self, "_tab_bars", {}) or {}).get(idx)
+
     def _gui_queue(self):
         """Every worker posts (kind, *args) here; main thread flushes it.
         Starts once widgets are available (lazy)."""
@@ -1895,8 +2126,30 @@ class App:
                                 self._blog.see(tk.END)
                             elif kind == "bstat":
                                 self._bstat.config(text=str(a))
-                            elif kind == "status" and hasattr(self, "_status"):
-                                self._status.config(text=str(a))
+                                _mb = re.match(r"\[(\d+)/(\d+)\]", str(a))
+                                if _mb and hasattr(self, "_tab_bars"):
+                                    _bb = self._tab_bars.get(3)  # batch tab
+                                    if _bb:
+                                        _bb[0].config(
+                                            value=100.0 * int(_mb.group(1)) /
+                                            max(int(_mb.group(2)), 1))
+                                        _bb[1].config(text=str(a)[:90])
+                            elif kind == "status":
+                                # per-tab progress parity (2026-11): route the
+                                # download status line to the front tab's bar
+                                if hasattr(self, "_status"):
+                                    self._status.config(text=str(a))
+                                _pb = self._pb_for_active_tab()
+                                if _pb:
+                                    _txt = str(a)
+                                    _mm = re.search(r"(\d+(?:\.\d+)?)\s*%", _txt)
+                                    if _mm:
+                                        _pb[0].config(value=float(_mm.group(1)))
+                                    elif "encoding" in _txt:
+                                        _pb[0].config(value=99)
+                                    elif _txt.startswith(("✓", "✗")):
+                                        _pb[0].config(value=0)
+                                    _pb[1].config(text=_txt[:90])
                         except Exception:
                             pass
                         self._gq.task_done()
@@ -2029,6 +2282,7 @@ class App:
         self._sstat.pack(side="left", padx=12)
         self._watermark_label(card).pack(anchor="e")
         self._slog = self._log(o)
+        self._add_tab_progress(nb, o)
 
     def _do_single(self):
         url = self._surl.get().strip()
@@ -2054,13 +2308,27 @@ class App:
         self._sstat.config(text="Downloading…")
 
         def run():
-            s, m = download_one(url, url, self._sdir.get(),
+            # 2026-11 naming: resolve real metadata so the file is named
+            # Song - Artist -- never as the URL (the literal old bug)
+            _vt, _up, _vid = _resolve_url_meta(url)
+            _song, _art = _split_video_title(_vt, _up) if _vt else ("", "")
+            _name = want_filename(_song, _art) if _song else ""
+            s, m = download_one(_name, url, self._sdir.get(),
                                "audio" if "audio" in self._sfmt.get() else "video",
                                self.qkey(self._sq.get()),
                                self.cfg.get("speed_limit_kbps", 0),
                                browser=self.browser(), cancel_event=ev,
                                cookiefile=self._yt_cookiefile(),
                                subs=self.cfg.get("fetch_subtitles", False))
+            _qual = self.qkey(self._sq.get())
+            if s == "ok" and _name and str(_qual).startswith("opus"):
+                # fixups expect the .opus produced by the Opus lane; m4a and
+                # video lanes skip rather than no-op on a nonexistent path
+                try:
+                    _post_download_fixups(self._sdir.get(), _name, _song,
+                                          _art, res_title=_vt or "")
+                except Exception:
+                    pass
             def _summarize():
                 if s != "ok":
                     self._sstat.config(text=f"✗ {m[:60]}")
@@ -2107,6 +2375,7 @@ class App:
     def _tab_playlist(self, nb):
         o = tk.Frame(nb, bg=BG)
         nb.add(o, text="  Playlist  ")
+        self._add_tab_progress(nb, o)
         _prefs_card = tk.Frame(o, bg=BG2)
         _prefs_card.pack(fill="x", padx=8, pady=2)
         self._search_prefs_row(_prefs_card, "src_playlist")
@@ -2185,7 +2454,10 @@ class App:
                 self._ui(do)
 
             def work(i, e):
-                download_one(e.get("title", "?"),
+                _vt = e.get("title") or "?"
+                _song, _art = _split_video_title(
+                    _vt, e.get("uploader") or e.get("channel") or "")
+                download_one(want_filename(_song, _art) if _song else _vt,
                              f"https://www.youtube.com/watch?v={e.get('id')}",
                              save, dtype, qual, self.cfg.get("speed_limit_kbps", 0),
                              browser=browser,
@@ -2204,6 +2476,7 @@ class App:
     def _tab_search(self, nb):
         o = tk.Frame(nb, bg=BG)
         nb.add(o, text="  Search  ")
+        self._add_tab_progress(nb, o)
         _prefs_card = tk.Frame(o, bg=BG2)
         _prefs_card.pack(fill="x", padx=8, pady=2)
         self._search_prefs_row(_prefs_card, "src_search")
@@ -2407,12 +2680,30 @@ class App:
 
         def run():
             fmt = self._sfmt2.get()
-            for it in items:
-                download_one(it["title"], it["url"], save, fmt, qual,
+            _n = len(items)
+            for _i, it in enumerate(items):
+                _song, _art = _split_video_title(
+                    it.get("title", ""), it.get("channel", ""))
+                _ti = it.get("title", "")[:30]
+
+                def _sc(s, _i=_i, _ti=_ti, _n=_n):
+                    # parity (2026-11): status text on this tab + percent to
+                    # the front-tab bar via the same "status" channel the
+                    # Spotify tab drives
+                    self._ui(lambda s=s, _i=_i, _ti=_ti, _n=_n: (
+                        self._sstat2.config(
+                            text=f"[{_i+1}/{_n}] {s} {_ti[:24]}")))
+                    try:
+                        self._gq.put(("status", f"[{_i+1}/{_n}] {s}"))
+                    except Exception:
+                        pass
+
+                download_one(want_filename(_song, _art) if _song
+                             else it.get("title", ""), it["url"], save, fmt, qual,
                              self.cfg.get("speed_limit_kbps", 0),
                              browser=self.browser(), cancel_event=ev,
                              cookiefile=self._yt_cookiefile(),
-                             status_cb=lambda s, ti=it["title"][:30]: None,
+                             status_cb=_sc,
                              subs=self.cfg.get("fetch_subtitles", False))
             self._ui(lambda: self._sstat2.config(text="✓ Complete"))
         threading.Thread(target=run, daemon=True).start()
@@ -2504,6 +2795,7 @@ class App:
     def _tab_batch(self, nb):
         o = tk.Frame(nb, bg=BG)
         nb.add(o, text="  Batch CSV  ")
+        self._add_tab_progress(nb, o)
         _prefs_card = tk.Frame(o, bg=BG2)
         _prefs_card.pack(fill="x", padx=8, pady=2)
         self._search_prefs_row(_prefs_card, "src_batch")
@@ -2593,23 +2885,14 @@ class App:
 
         counts = _col.Counter()
         try:
-            with _zf.ZipFile(dlg) as z:
-                names = [n for n in z.namelist()
-                         if n.endswith(".json")
-                         and "Streaming_History_Audio" in n]
-                if not names:
-                    messagebox.showerror("No history found",
-                        "No Streaming_History_Audio*.json inside that zip.")
-                    return
-                for n in names:
-                    for rec in _j.loads(z.read(n)):
-                        name = rec.get("master_metadata_track_name")
-                        art = rec.get("master_metadata_album_artist_name") or ""
-                        if not name:
-                            continue
-                        k = (name.strip(), art.strip())
-                        # presence only; durations resolved separately
-                        counts.setdefault(k, 0)
+            pairs = _parse_spotify_history_zip(dlg)
+            if not pairs:
+                messagebox.showerror("No history found",
+                    "No Streaming_History_Audio*.json inside that zip.")
+                return
+            for k in pairs:
+                # presence only; durations resolved separately
+                counts.setdefault(k, 0)
         except Exception as e:
             messagebox.showerror("Import failed", str(e)[:200])
             return
@@ -2722,8 +3005,7 @@ class App:
                     except Exception:
                         pass
             return
-        want_fn = re.sub(r'[<>:"/\\|?*]', "_",
-                         (artist + " - " + track) if artist else track).strip(" .")[:200]
+        want_fn = want_filename(track, artist)
         tried = ([matched] if isinstance(matched, dict) else []) + [
             r for r in (results or [])
             if isinstance(r, dict)
@@ -3225,10 +3507,13 @@ class App:
            title's first 2 tokens present) - order-independent
         3. strong substring containment either way"""
         n1 = self._normalize_match(f"{track} {artist}")
+        n1b = self._normalize_match(f"{artist} {track}") if artist else ""
         n2 = self._normalize_match(track)
         if n2 and (n2 in file_norms):
             return True
         if n1 and n1 in file_norms:
+            return True
+        if n1b and n1b in file_norms:
             return True
 
         def toks(s):
@@ -3372,7 +3657,18 @@ class App:
             return None, "; ".join(errs)
 
     def _sp_api_playlists(self):
-        """User playlists via OAuth if connected; else None (caller falls back)."""
+        """User playlists. 1) libraryV3 partner-GQL via the sp_dc bearer
+        (proven live 2026-11-04: 22 real playlists; OAuth /v1/me/*
+        hard-403s on this client ID - the logged-in-but-empty-library
+        bug); 2) OAuth fallback for other installs; else None (caller
+        falls back to the home feed)."""
+        try:
+            pls = sp.get_my_playlists_dc(limit=50)
+            if pls:
+                _dbg("sp playlists via libraryV3 sp_dc: %d" % len(pls))
+                return pls
+        except Exception:
+            pass
         try:
             if spo:
                 tok = spo.get_access_token(None)
@@ -3437,9 +3733,15 @@ class App:
                             p.get("name", "?"), p.get("owner", ""),
                             p.get("tracks", "")))
                         self._spmap[iid] = p
-                self._spstat.config(
-                    text=f"● {len(self._spmap)} playlists loaded",
-                    fg="#1DB954")
+                if self._spmap:
+                    self._spstat.config(
+                        text=f"● {len(self._spmap)} playlists loaded",
+                        fg="#1DB954")
+                else:
+                    # never a silently empty tree -- say why and how to fix it
+                    self._spstat.config(
+                        text="● no playlists — Settings → Login to Spotify "
+                             "(or export cookies.txt)", fg="#e63946")
             self._ui(fill)
         threading.Thread(target=run, daemon=True).start()
 
@@ -3611,9 +3913,7 @@ class App:
                                 cookiefile=self._yt_cookiefile(),
                                 subs=self.cfg.get("fetch_subtitles", False))
                             if s == "ok":
-                                want_fn = (artists + " - " + name)
-                                want_fn = re.sub(r'[<>:"/\\|?*]', "_",
-                                                 want_fn).strip(" .")[:200]
+                                want_fn = want_filename(name, artists)
                                 genre = (tracks[i][3]
                                          if len(tracks[i]) > 3 else "")
                                 _post_download_fixups(
@@ -3743,7 +4043,6 @@ class App:
                     status(f"\u2717 {name[:24]}: could not create YT Music playlist")
                     continue
                 tracks, ferr = self._sp_api_tracks(pl["id"])
-                tracks, ferr = self._sp_api_tracks(pl["id"])
                 if not tracks:
                     status(f"\u26a0 {name[:24]}: no tracks ({ferr})")
                     continue
@@ -3778,11 +4077,24 @@ class App:
                                  "views": h.get("views") or 0,
                                  "url": h.get("url") or ""}
                                 for h in hits if h.get("videoId") or h.get("id")]
-                    best = pick_best(hits, target_seconds=tsec,
-                                     artist=tartist, title=tname,
-                                     browser=browser,
-                                     cookiefile=self._yt_cookiefile(),
-                                     enrich_top=0) if hits else None
+                    best = None
+                    if hits:
+                        try:
+                            import matchers as _mt
+                            # strict matcher everywhere (2026-11): no more
+                            # most-viewed-wins picks feeding covers/live cuts
+                            best = _mt.strict_match(hits, tname, tartist)
+                        except Exception:
+                            best = None
+                        if best is None:
+                            try:
+                                best = pick_best(hits, target_seconds=tsec,
+                                                 artist=tartist, title=tname,
+                                                 browser=browser,
+                                                 cookiefile=self._yt_cookiefile(),
+                                                 enrich_top=0)
+                            except Exception:
+                                best = None
                     vid = best.get("id") if best else None
                     if vid and _itb.add_to_playlist(pid, vid, _ck):
                         ok += 1
@@ -3920,7 +4232,20 @@ class App:
             if f.endswith(".opus") and f not in index:
                 base = f[:-5]
                 if " - " in base:
-                    artist, track = base.split(" - ", 1)
+                    # 2026-11 flip: downloads after the flip are 'Song -
+                    # Artist', legacy files are 'Artist - Song'. Disambiguate
+                    # by mtime against the flip date; _index.txt is ALWAYS
+                    # authoritative when an entry exists.
+                    left, right = base.split(" - ", 1)
+                    try:
+                        _new = (os.path.getmtime(os.path.join(music, f))
+                                >= _NAMING_FLIP_TS)
+                    except Exception:
+                        _new = False
+                    if _new:
+                        track, artist = left, right
+                    else:
+                        artist, track = left, right
                 else:
                     artist, track = "", base
                 index[f] = {"track": track, "artist": artist, "uri": ""}
@@ -3950,9 +4275,12 @@ class App:
             if f"{info['track']}|{info['artist']}" == key:
                 if os.path.exists(os.path.join(self._music_dir(), fn)):
                     return fn
-        norm = self._normalize_match(f"{track} {artist}")
-        if norm in file_norms:
-            return file_norms[norm]
+        # order-agnostic: legacy files are 'Artist - Song', new downloads
+        # (2026-11 flip) are 'Song - Artist' -- check BOTH normalized orders
+        for _pair in ((track, artist), (artist, track)):
+            norm = self._normalize_match(" ".join(x for x in _pair if x))
+            if norm and norm in file_norms:
+                return file_norms[norm]
         track_norm = self._normalize_match(track)
         if track_norm and len(track_norm) > 5:
             for fnorm, fn in file_norms.items():
@@ -4157,29 +4485,34 @@ class App:
                     q = f"{track} {artist}"
                     status(f"[{pi+1}/{npl}] [{i+1}/{total}] \U0001f50d {track[:30]} — {artist[:15]}")
                     try:
-                        results = search_youtube(q, 6, browser)
-                        if not results:
+                        # strict matcher everywhere (2026-11): same pipeline
+                        # as batch/spotify -- caps, junk gates, official boosts.
+                        # Prefs from this tab's Search-in/length-caps row; a
+                        # known duration widens the window to +/-25% around it
+                        _psrc, _pcon, _pmin, _pmax = self._get_search_prefs(
+                            "src_spotify")
+                        matched, results = _match_track(
+                            track, artist, browser,
+                            {"source": _psrc, "cap_on": _pcon,
+                             "cap_min": _pmin, "cap_max": _pmax},
+                            n=6, dur_s=(tsec or None))
+                        if not matched:
                             dl_fail += 1
-                            status(f"[{pi+1}/{npl}] ✗ not found: {track[:25]}")
+                            status(f"[{pi+1}/{npl}] ✗ no strict match: "
+                                   f"{track[:25]}")
                             continue
-                        # pick the most-viewed duration-matched result instead
-                        # of blindly trying result[0] first
-                        best = pick_best(results, target_seconds=tsec or None,
-                                         artist=artist, title=track,
-                                         browser=browser,
-                                         cookiefile=self._yt_cookiefile())
-                        ordered = ([best] + [r for r in results if r is not best]
-                                   if best else results)
+                        ordered = ([matched] +
+                                   [r for r in (results or [])
+                                    if isinstance(r, dict)
+                                    and r.get("id") != matched.get("id")])
                         downloaded = False
                         for r_idx, res in enumerate(ordered):
                             if ev.is_set():
                                 break
                             yt_title = res["title"]
-                            # save as "Artist - Title" so library tags/m3u match
-                            # Spotify metadata, not the YouTube video title
-                            want_fn = re.sub(r'[<>:\"/\\|?*]', "_",
-                                             f"{artist} - {track}"
-                                             if artist else track).strip(" .")[:200]
+                            # save as Song - Artist (2026-11 flip) so tags/m3u
+                            # match Spotify metadata, not the YT video title
+                            want_fn = want_filename(track, artist)
                             state, result = download_one(
                                 want_fn, res["url"], music,
                                 self._spfmt.get(), qual, 0,
@@ -4628,11 +4961,26 @@ class App:
             url = f"https://www.youtube.com/watch?v={vid}"
             self._ui(lambda i=i, t=total, ti=title: (
                 self._ytmstat.config(text=f"\u25cf [{i+1}/{t}] {ti[:30]}")))
-            s, m = download_one(title, url, save_dir, self._ytmfmt.get(), premium_q,
+            _song, _art = _split_video_title(
+                title, e.get("uploader") or e.get("channel") or "")
+            def _ysc(s, _i=i, _t=total):
+                # parity (2026-11): drive the YTM tab's own bar + label
+                def _do(s=s, _i=_i, _t=_t):
+                    try:
+                        self._ytmpb.config(
+                            value=min(100.0, 100.0 * (_i + 1) / max(_t, 1)))
+                        self._ytmpblabel.config(
+                            text=f"[{_i+1}/{_t}] {s[:40]}")
+                    except Exception:
+                        pass
+                self._ui(_do)
+
+            s, m = download_one(want_filename(_song, _art) if _song else title,
+                                url, save_dir, self._ytmfmt.get(), premium_q,
                                 self.cfg.get("speed_limit_kbps", 0),
                                 browser=b, cancel_event=ev,
                                 cookiefile=self._yt_cookiefile(),
-                                status_cb=lambda st: None,
+                                status_cb=_ysc,
                                 subs=self.cfg.get("fetch_subtitles", False))
             if s == "ok":
                 ok += 1
@@ -6956,7 +7304,7 @@ class App:
         row_dc = tk.Frame(cf, bg=BG2); row_dc.pack(fill="x", pady=2)
         tk.Label(row_dc, text="Spotify cookies.txt:", bg=BG2, fg=FG2,
                  font=FONT).pack(side="left", padx=8, anchor="n")
-        self._spdc_row = self._folder_row(row_dc, label="")
+        self._spdc_row = self._file_row(row_dc, label="")
         self._spdc_path = self.cfg.get("sp_cookies_file", "")
         if self._spdc_path:
             self._spdc_row.delete(0, tk.END)
@@ -6964,7 +7312,7 @@ class App:
         row_dy = tk.Frame(cf, bg=BG2); row_dy.pack(fill="x", pady=2)
         tk.Label(row_dy, text="YouTube cookies.txt:", bg=BG2, fg=FG2,
                  font=FONT).pack(side="left", padx=8, anchor="n")
-        self._ytck_row = self._folder_row(row_dy, label="")
+        self._ytck_row = self._file_row(row_dy, label="")
         self._ytck_path = self.cfg.get("yt_cookies_file", "")
         if self._ytck_path:
             self._ytck_row.delete(0, tk.END)
@@ -7085,7 +7433,7 @@ class App:
                    hint="How many downloads run at once (default 3)")
         _entry_row("Proxy (http/https/socks5://host:port)", "proxy",
                    hint="leave blank for direct connection")
-        _entry_row("Subtitle language (blank = auto en/en-US/en-GB)", "subtitle_lang")
+        _entry_row("Subtitle language (blank = native first, en fallback)", "subtitle_lang")
         _entry_row("Playlist items (e.g. 1-10,15)", "playlist_items",
                    hint="download only these playlist items; blank = all")
         # Source selector: YouTube Music vs YouTube vs both
@@ -7869,6 +8217,21 @@ class App:
                     who = (me or {}).get("display_name") or "Spotify account"
                     self._ui(lambda w=who: self._loginstat.config(
                         text=f"✓ Spotify connected as {w}", fg="#1DB954"))
+                    # fresh-install fix (2026-11): the webview captured the
+                    # Spotify cookies to ~/.spotify_cookies.txt -- harvest
+                    # sp_dc so the libraryV3 route works right after login
+                    # (OAuth /v1/me/* hard-403s on this client ID).
+                    try:
+                        _cp = os.path.join(os.path.expanduser("~"),
+                                           ".spotify_cookies.txt")
+                        _dc = sp.get_sp_dc_from_cookies_file(_cp)
+                        if _dc:
+                            with open(sp.SP_DC_PATH, "w",
+                                      encoding="utf-8") as f:
+                                f.write(_dc)
+                            _dbg("sp_dc harvested post-login (size only)")
+                    except Exception:
+                        pass
                 else:
                     self._ui(lambda: self._loginstat.config(
                         text="✗ Spotify login not completed",
@@ -7902,6 +8265,17 @@ class App:
             who = me.get("display_name") or "Spotify"
             self._loginstat.config(text=f"✓ Spotify connected as {who}",
                                    fg="#1DB954")
+            # same fresh-install harvest as the webview path (2026-11)
+            try:
+                _cp = os.path.join(os.path.expanduser("~"),
+                                   ".spotify_cookies.txt")
+                _dc = sp.get_sp_dc_from_cookies_file(_cp)
+                if _dc:
+                    with open(sp.SP_DC_PATH, "w", encoding="utf-8") as f:
+                        f.write(_dc)
+                    _dbg("sp_dc harvested post-paste (size only)")
+            except Exception:
+                pass
         else:
             messagebox.showerror(
                 "Exchange failed",

@@ -341,6 +341,114 @@ def logged_in_token():
         return anon_token()
 
 
+_LIBV3_CACHE = {"sha": "", "ts": 0.0}
+
+
+def _libraryv3_hash():
+    """The libraryV3 persisted-query hash, re-extracted LIVE from the
+    desktop web-player bundle (hand-copied hashes go stale -> 412 Invalid
+    query hash). Cached ~1h. Raises SpotifyError when not found, so
+    callers fall back instead of guessing."""
+    if _LIBV3_CACHE["sha"] and time.time() - _LIBV3_CACHE["ts"] < 3600:
+        return _LIBV3_CACHE["sha"]
+    import re as _re
+    _dua = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+    html = _get("https://open.spotify.com/collection/playlists",
+                headers={"User-Agent": _dua}).decode("utf-8", "replace")
+    urls = _re.findall(r'https://[^"\'\s]+(?:web-player|encore)[^"\'\s]*\.js',
+                       html)
+    seen = []
+    for u in urls:
+        if u not in seen:
+            seen.append(u)
+    for u in seen[:3]:
+        try:
+            bundle = _get(u, headers={"User-Agent": _dua}).decode(
+                "utf-8", "replace")
+        except Exception:
+            continue
+        for hx in _re.findall(r'"([0-9a-f]{64})"', bundle):
+            i = bundle.find(hx)
+            if "libraryV3" in bundle[max(0, i - 60): i + 80]:
+                _LIBV3_CACHE["sha"] = hx
+                _LIBV3_CACHE["ts"] = time.time()
+                return hx
+    raise SpotifyError("libraryV3 hash not found in web-player bundle")
+
+
+def _parse_libv3_rows(rows):
+    """libraryV3 rows -> [{id, uri, name, owner, tracks}]. Rows nest as
+    {"item": {"_uri": "spotify:playlist:...", "data": {...}}} (live-probed
+    2026-11-04); tolerant of garbage/None rows. Note: the Playlist typename
+    carries NO track-count field, so 'tracks' stays blank (cosmetic)."""
+    out = []
+    for it in rows or []:
+        w = it.get("item") if isinstance(it, dict) else None
+        if not isinstance(w, dict):
+            continue
+        d = w.get("data") if isinstance(w.get("data"), dict) else {}
+        uri = (w.get("_uri") or d.get("uri") or "")
+        pid = (uri.split(":")[-1] if uri.startswith("spotify:playlist:")
+               else (d.get("id") or ""))
+        if not pid:
+            continue
+        tc = (d.get("trackCount")
+              or ((d.get("contents") or {}).get("totalCount"))
+              or ((d.get("tracks") or {}).get("totalCount")) or "")
+        out.append({"id": pid, "uri": uri,
+                    "name": d.get("name") or "(unnamed)",
+                    "owner": "you", "tracks": tc})
+    return out
+
+
+def get_my_playlists_dc(limit=50):
+    """User playlists via the partner GQL `libraryV3` persisted query.
+    Two REST routes are dead ends on this client ID: OAuth /v1/me/* 403s
+    ("Active premium subscription required" - the logged-in-but-empty-
+    library bug) and the REST sp_dc bearer 429s within a single probe
+    (measured 2026-11-04). The partner GQL with the logged-in bearer is the
+    ops-skill-documented route for full-library work; _gql already prefers
+    logged_in_token() when a sp_dc exists. None on any failure so callers
+    keep their existing fallbacks."""
+    try:
+        if not stored_sp_dc():
+            return None
+        sha = _libraryv3_hash()
+        out, offset = [], 0
+        _retried = False
+        while True:
+            data = _gql("libraryV3", {
+                "filters": ["Playlists"], "order": None, "textFilter": None,
+                "features": [], "limit": min(int(limit), 50), "offset": offset,
+                "flatten": False, "expandedFolders": [], "folderUri": None,
+                "includeFoldersWhenFlattening": True,
+            }, sha)
+            lib = ((data.get("data") or {}).get("me") or {}).get("libraryV3") or {}
+            tn = lib.get("__typename") or "LibraryPage"
+            if tn != "LibraryPage":
+                if _retried:
+                    break  # GQL errors ride HTTP 200 -- never trust the code
+                # stale persisted-query hash: clear cache, re-extract, retry once
+                _LIBV3_CACHE["sha"] = ""
+                _LIBV3_CACHE["ts"] = 0.0
+                sha = _libraryv3_hash()
+                _retried = True
+                continue
+            rows = lib.get("items") or []
+            if not rows:
+                break
+            out.extend(_parse_libv3_rows(rows))
+            offset += len(rows)
+            total = lib.get("totalCount") or 0
+            if (offset >= total and total) or offset >= 300 or len(out) >= int(limit):
+                break
+            time.sleep(1.0)
+        return out or None
+    except Exception:
+        return None
+
+
 class SpotifyError(Exception):
     pass
 

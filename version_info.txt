@@ -2,8 +2,8 @@
 # Version resource file for Shungite.exe
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(1, 0, 0, 0),
-    prodvers=(1, 0, 0, 0),
+    filevers=(1, 1, 1, 0),
+    prodvers=(1, 1, 1, 0),
     mask=0x3F,
     flags=0x0,
     OS=0x40004,
@@ -19,12 +19,12 @@ VSVersionInfo(
           [
             StringStruct("CompanyName", "Irteza Asif"),
             StringStruct("FileDescription", "SHUNGITE - YouTube Music + Spotify Downloader"),
-            StringStruct("FileVersion", "1.0.0.0"),
+            StringStruct("FileVersion", "1.1.1.0"),
             StringStruct("InternalName", "Shungite"),
             StringStruct("LegalCopyright", "(c) 2026 Irteza Asif. MIT License."),
             StringStruct("OriginalFilename", "Shungite.exe"),
             StringStruct("ProductName", "SHUNGITE"),
-            StringStruct("ProductVersion", "1.0.0.0"),
+            StringStruct("ProductVersion", "1.1.1.0"),
           ],
         ),
       ],

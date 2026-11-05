@@ -250,12 +250,38 @@ def _walk(node, key):
             yield from _walk(it, key)
 
 
+_LAST_ERROR = ""
+
+
+def _library_shell_state(data):
+    """Classify a browse response: 'rows' | 'logged-out' | 'alive-empty'.
+
+    A server-side-invalidated session gets the SAME 200 a logged-out visitor
+    gets: a messageRenderer + Sign-in button (signInEndpoint), zero content
+    rows. accounts_list is NOT a liveness oracle (0 items even for a working
+    session — proven live 2026-11-05), so the response shape itself decides.
+    """
+    for _ in _walk(data, "musicTwoRowItemRenderer"):
+        return "rows"
+    if '"signInEndpoint"' in json.dumps(data):
+        return "logged-out"
+    return "alive-empty"
+
+
 def get_library_playlists(cookies_dict):
-    """Return [{playlistId, title, count}] for the user's YT Music library."""
+    """Return [{playlistId, title}] for the user's YT Music library.
+
+    Sets _LAST_ERROR so callers can distinguish a dead (logged-out) session
+    from a genuinely empty library — the YTM tab used to render both as
+    silence. Never raises; browse failures surface in _LAST_ERROR too.
+    """
+    global _LAST_ERROR
+    _LAST_ERROR = ""
     body = {"browseId": "FEmusic_liked_playlists"}
     try:
         data = _post("browse", body, cookies_dict)
-    except Exception:
+    except Exception as e:
+        _LAST_ERROR = "browse failed: %s: %s" % (type(e).__name__, str(e)[:60])
         return []
     out = []
     seen = set()
@@ -271,4 +297,10 @@ def get_library_playlists(cookies_dict):
                 out.append({"playlistId": pid, "title": title})
         except Exception:
             continue
+    if not out:
+        state = _library_shell_state(data)
+        if state == "logged-out":
+            _LAST_ERROR = "logged-out (server sign-in CTA)"
+        else:
+            _LAST_ERROR = "alive but empty library"
     return out

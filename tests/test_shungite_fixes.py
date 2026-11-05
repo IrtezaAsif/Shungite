@@ -333,3 +333,112 @@ def test_split_video_title_descriptor_segment():
                                            "Some Channel")
     assert song == "Song Name"
     assert artist == "Some Channel"
+
+
+# ── 8. YTM library: dead-session oracle + fallback chain (2026-11-05) ────────
+
+inn = _load("innertube_test", os.path.join(PEAK_DIR, "innertube.py"))
+bcook = _load("browser_cookies_test", os.path.join(PEAK_DIR, "browser_cookies.py"))
+sys.modules["innertube"] = inn          # lazy `import innertube` in helpers
+sys.modules["browser_cookies"] = bcook
+
+
+def _shell_logged_out():
+    """The exact shape YouTube serves a dead session (v3 probe, live).
+
+    Built programmatically: the deep literal once miscounted braces and
+    broke the whole module's import — construction beats brace-counting.
+    """
+    message = {
+        "text": {"runs": [{"text": "Looking for what you've liked?"}]},
+        "button": {"buttonRenderer": {"navigationEndpoint": {"signInEndpoint": {}}}},
+    }
+    item_section = {"contents": [{"messageRenderer": message}]}
+    section = {"contents": [{"itemSectionRenderer": item_section}]}
+    tab = {"tabRenderer": {"content": {"sectionListRenderer": section}}}
+    return {"contents": {"singleColumnBrowseResultsRenderer": {"tabs": [tab]}}}
+
+
+def _grid_alive():
+    """Canonical logged-in shape (ytmusicapi GRID): two-row items in a grid."""
+    def row(pid, title):
+        return {"musicTwoRowItemRenderer": {
+            "navigationEndpoint": {"browseEndpoint": {"browseId": pid}},
+            "title": {"runs": [{"text": title}]}}}
+
+    grid = {"items": [row("VLPLaaa111", "Anime Mix"),
+                      row("VLPLbbb222", "Gym Pump"),
+                      row("MPREb_album1", "Some Album")]}
+    section = {"contents": [{"gridRenderer": grid}]}
+    tab = {"tabRenderer": {"content": {"sectionListRenderer": section}}}
+    return {"contents": {"singleColumnBrowseResultsRenderer": {"tabs": [tab]}}}
+
+
+def test_ytm_library_detects_logged_out_shell(monkeypatch):
+    monkeypatch.setattr(inn, "_post", lambda ep, body, ck: _shell_logged_out())
+    assert inn.get_library_playlists({"SID": "x"}) == []
+    assert "logged-out" in inn._LAST_ERROR
+
+
+def test_ytm_library_parses_alive_grid_rows(monkeypatch):
+    monkeypatch.setattr(inn, "_post", lambda ep, body, ck: _grid_alive())
+    out = inn.get_library_playlists({"SID": "x"})
+    assert [p["playlistId"] for p in out] == ["VLPLaaa111", "VLPLbbb222"]
+    assert inn._LAST_ERROR == ""
+
+
+def test_ytm_library_alive_empty_vs_logged_out(monkeypatch):
+    monkeypatch.setattr(inn, "_post", lambda ep, body, ck: {"contents": {}})
+    assert inn.get_library_playlists({"SID": "x"}) == []
+    assert "empty" in inn._LAST_ERROR
+    assert "logged-out" not in inn._LAST_ERROR
+
+
+def test_ytm_library_error_state(monkeypatch):
+    def boom(ep, body, ck):
+        raise RuntimeError("http 500")
+    monkeypatch.setattr(inn, "_post", boom)
+    assert inn.get_library_playlists({"SID": "x"}) == []
+    assert "failed" in inn._LAST_ERROR
+
+
+def test_yt_cookie_names_include_rotating():
+    for n in ("__Secure-1PSIDTS", "__Secure-3PSIDTS", "LOGIN_INFO"):
+        assert n in bcook._YT_NAMES
+
+
+def test_ytm_source_fallback_jar_dead_browser_alive():
+    calls = []
+
+    def fetch(ck):
+        calls.append(ck.get("src"))
+        if ck.get("src") == "jar":
+            inn._LAST_ERROR = "logged-out (server sign-in CTA)"
+            return []
+        inn._LAST_ERROR = ""
+        return [{"playlistId": "VLPLx", "title": "Anime Mix"}]
+
+    rows, ck, tag, diag, dead = peak._pick_ytm_cookie_source(
+        [("jar", {"src": "jar"}), ("browser", {"src": "browser"})], fetch)
+    assert calls == ["jar", "browser"]
+    assert tag == "browser" and len(rows) == 1 and dead is False
+    assert ck.get("src") == "browser"
+
+
+def test_ytm_source_fallback_both_dead():
+    def fetch(ck):
+        inn._LAST_ERROR = "logged-out (server sign-in CTA)"
+        return []
+    rows, ck, tag, diag, dead = peak._pick_ytm_cookie_source(
+        [("jar", {"src": "jar"}), ("browser", {"src": "browser"})], fetch)
+    assert rows == [] and tag == "" and dead is True
+    assert len(diag) == 2
+
+
+def test_ytm_source_chain_stops_on_alive_empty():
+    def fetch(ck):
+        inn._LAST_ERROR = "alive but empty library"
+        return []
+    rows, ck, tag, diag, dead = peak._pick_ytm_cookie_source(
+        [("jar", {"src": "jar"}), ("browser", {"src": "browser"})], fetch)
+    assert rows == [] and dead is False and tag == "jar"

@@ -12,3 +12,4 @@ tqdm>=4.65
 # Build-time only (used to DO the packaging, not bundled)
 pyinstaller
 pyinstaller-hooks-contrib   # pandas/PyInstaller hooks
+pycryptodome>=4.3.0

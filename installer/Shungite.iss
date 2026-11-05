@@ -12,7 +12,7 @@
 
 #define MyAppName "SHUNGITE"
 #define MyAppExeName "Shungite.exe"
-#define MyAppVersion "1.1.1"
+#define MyAppVersion "1.1.2"
 #define MyAppPublisher "Irteza Asif"
 #define MyAppURL "https://github.com/IrtezaAsif/Shungite"
 #define MyAppYear "2026"

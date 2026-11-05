@@ -16,6 +16,7 @@ if _missing:
 hidden = (
     collect_submodules("yt_dlp")
     + ["mutagen", "browser_cookies", "spotify_api", "login_window", "matchers", "rapidfuzz"]
+    + collect_submodules("Crypto")   # pycryptodome: _aesgcm imports Crypto.Cipher.AES inside a function, so static analysis cannot see it
     + collect_submodules("webview")
     + ["webview.platforms.edgechromium", "webview.platforms.winforms",
        "webview.platforms.windowsforms", "clr", "clr_loader", "pythonnet"]

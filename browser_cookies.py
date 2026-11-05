@@ -166,6 +166,14 @@ def _app_bound_key_best_effort(root):
     except Exception:
         return None
 
+_DECRYPT_EXC_COUNTS = {}
+
+
+def crypto_status():
+    """Counts-only decrypt diagnostics: exception-type -> count."""
+    return dict(_DECRYPT_EXC_COUNTS)
+
+
 def _aesgcm(key, nonce, ct, tag=None):
     from Crypto.Cipher import AES
     c = AES.new(key, AES.MODE_GCM, nonce=nonce)
@@ -188,13 +196,18 @@ def _decrypt(enc, key, ab_key=None):
     if enc[:3] in (b"v10", b"v11"):
         try:
             pt = _aesgcm(key, enc[3:15], enc[15:-16], enc[-16:])
-            # Chrome/Edge "application-bound" protection prepends a 32-byte
-            # SHA256(domain) hash to the plaintext of v10/v11 cookies. Strip it
-            # when present; otherwise leave the (already clean) value intact.
+            # Edge/WebView2 "application-bound" protection prepends a 32-byte
+            # RAW SHA256(domain) hash to the plaintext of v10/v11 cookies.
+            # Strip it ONLY when the first 32 bytes are binary (the hash
+            # signature): standard-Chromium v10 cookies carry NO prefix, and
+            # their long printable auth tokens were silently truncated here
+            # (proven: 200-char synthetic round-trip lost exactly 32 bytes).
             _allowed = set(
                 b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
                 b"0123456789_./-=|%:;")
-            if len(pt) > 32 and all(b in _allowed for b in pt[32:]):
+            _prefix_binary = not all(32 <= b < 127 for b in pt[:32])
+            if len(pt) > 32 and _prefix_binary and all(
+                    b in _allowed for b in pt[32:]):
                 pt = pt[32:]
             # Purge any value that still carries non-ASCII/garbage (a failed
             # or partial decrypt). The essential auth cookies (SAPISID/SID/
@@ -203,7 +216,9 @@ def _decrypt(enc, key, ab_key=None):
             if any(b < 32 or b > 126 for b in pt):
                 return ""
             return pt.decode("utf-8", "replace")
-        except Exception:
+        except Exception as e:
+            _DECRYPT_EXC_COUNTS[type(e).__name__] = (
+                _DECRYPT_EXC_COUNTS.get(type(e).__name__, 0) + 1)
             return ""
     if enc[:3] == b"v20":
         # app-bound: try best-effort key; plaintext may carry a 32-byte
@@ -702,7 +717,8 @@ def get_sp_dc():
 
 _YT_NAMES = ["SID", "HSID", "SSID", "APISID", "SAPISID",
              "__Secure-1PSID", "__Secure-3PSID",
-             "__Secure-1PAPISID", "__Secure-3PAPISID"]
+             "__Secure-1PAPISID", "__Secure-3PAPISID",
+             "__Secure-1PSIDTS", "__Secure-3PSIDTS", "LOGIN_INFO"]
 
 def youtube_cookie_header():
     pairs = []
@@ -735,6 +751,140 @@ def yt_cookies_dict_from_file(path=None):
         pass
     return out
 
+
+def yt_cookies_dict_complete():
+    """ALL youtube.com cookies from installed browsers (the LIVE session set).
+
+    The fixed 9-name header misses the rotating __Secure-*PSIDTS and
+    LOGIN_INFO cookies modern YouTube auth expects — a session carried by
+    the short set is served the logged-out shell even when the browser is
+    logged in (proven live 2026-11-05: complete set -> real library rows,
+    9-name set -> sign-in CTA). Firefox plaintext DBs first (copied before
+    reading), then Chromium names via the decrypting get_cookie.
+    Returns {name: value}; values are never logged anywhere.
+    """
+    out = {}
+    import sqlite3
+    try:
+        for db in _firefox_dbs():
+            tmp = _copy_any(db)
+            if not tmp:
+                continue
+            try:
+                con = sqlite3.connect(tmp)
+                rows = con.execute(
+                    "SELECT name, value FROM moz_cookies "
+                    "WHERE host LIKE '%youtube.com%'").fetchall()
+                for name, value in rows:
+                    if value:
+                        out[name] = value
+            except Exception:
+                pass
+            finally:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+    except Exception:
+        pass
+    try:
+        names = set()
+        for bname, root, exes in _chromium_roots():
+            for db, prof in _profile_credential_sets(root):
+                tmp = _copy_any(db)
+                if not tmp:
+                    continue
+                try:
+                    con = sqlite3.connect(tmp)
+                    for (n,) in con.execute(
+                            "SELECT DISTINCT name FROM cookies "
+                            "WHERE host_key LIKE '%youtube.com%'"):
+                        names.add(n)
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        os.remove(tmp)
+                    except OSError:
+                        pass
+        for n in sorted(names):
+            if n not in out:
+                v = get_cookie("youtube.com", n)
+                if v:
+                    out[n] = v
+    except Exception:
+        pass
+    return out
+
+
+def yt_cookies_dict_webview(profile=None):
+    """LIVE cookies from the app's embedded (WebView2) browser profile.
+
+    The user's directive (2026-11-05): the embedded browser is the PRIMARY
+    login surface, so its live DB — not the export snapshot — is the first
+    cookie source. The exported jar is only a snapshot of this DB and goes
+    stale server-side (~30 days observed); a re-login inside the app makes
+    THIS source fresh immediately, no export timing involved. Reads the same
+    Chromium-style DBs export_webview_cookies writes from, with the same
+    DPAPI/app-bound decryption. Values are never logged anywhere.
+    """
+    out = {}
+    import sqlite3
+    if not profile:
+        # mirror the app's data-dir convention: %LOCALAPPDATA%\..\LocalLow\Shungite
+        base = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
+        low = os.path.normpath(os.path.join(os.path.dirname(base), "LocalLow"))
+        profile = os.path.join(low, "Shungite", ".peak_webview")
+        if not os.path.isdir(profile):
+            profile = os.path.join(os.path.expanduser("~"), ".peak_webview")
+    if not profile or not os.path.isdir(profile):
+        return out
+    try:
+        key = _os_crypt_key(profile)
+        ab_key = _app_bound_key_best_effort(profile)
+    except Exception:
+        return out
+    for db, d in _webview_cookie_dbs(profile):
+        tmp = _raw_copy(db)
+        if not tmp:
+            continue
+        try:
+            con = sqlite3.connect(tmp)
+            cur = con.execute(
+                "SELECT host_key, name, encrypted_value, value FROM cookies")
+            for host, name, enc, plain in cur.fetchall():
+                if not host:
+                    continue
+                if not any(h in host.lower()
+                           for h in ("youtube.com", "google.com")):
+                    continue
+                val = None
+                if isinstance(plain, str) and plain and \
+                        not plain.startswith(("v10", "v11", "v20")):
+                    val = plain
+                else:
+                    try:
+                        raw = enc if enc else (
+                            plain.encode("latin-1", "ignore")
+                            if isinstance(plain, str) else plain)
+                        val = _decrypt(raw, key, ab_key)
+                    except Exception:
+                        val = None
+                if val and name:
+                    # youtube.com wins over google.com for shared cookie names
+                    # (SID/PREF exist on both hosts; last-write-wins could
+                    # otherwise substitute the wrong host's cookie)
+                    if name not in out or "youtube.com" in host.lower():
+                        out[name] = val
+            con.close()
+        except Exception:
+            pass
+        finally:
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+    return out
 
 
 def _webview_cookie_dbs(profile):

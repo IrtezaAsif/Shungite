@@ -1650,6 +1650,51 @@ def _post_download_fixups(music, want_fn, track, artist, res_title="",
         pass
 
 
+def _pick_ytm_cookie_source(sources, fetch):
+    """Pick the first cookie source whose YT Music library session is ALIVE.
+
+    sources: ordered [(tag, cookies_dict), ...] — webview jar first, complete
+    browser set as fallback. fetch: cookies_dict -> playlist rows.
+    Returns (rows, ck_used, tag_used, diag, session_dead). Never raises.
+    Diagnostics carry tags/states/counts only — never cookie values.
+
+    The liveness oracle is the library response shape itself (innertube sets
+    _LAST_ERROR): "logged-out (server sign-in CTA)" = dead session;
+    "alive but empty library" = logged in, nothing saved. accounts_list is
+    NOT an oracle — it returns 0 items even for working sessions.
+    """
+    import innertube as _itb
+    rows, diag, used_ck, used_tag = [], [], None, ""
+    dead = False
+    for tag, ck in sources:
+        if not ck:
+            continue
+        try:
+            rows = fetch(ck) or []
+        except Exception:
+            rows = []
+        state = getattr(_itb, "_LAST_ERROR", "") or ""
+        if rows:
+            diag.append("%s: ok rows=%d" % (tag, len(rows)))
+            return rows, ck, tag, diag, False
+        if "alive but empty" in state:
+            diag.append("%s: %s" % (tag, state))
+            return [], ck, tag, diag, False
+        if "logged-out" in state:
+            diag.append("%s: %s" % (tag, state))
+            dead = True
+            continue
+        diag.append("%s: %s" % (tag, state or "no rows"))
+        dead = True
+    return [], used_ck, used_tag, diag, dead
+
+
+def _ytm_fetch_lib_rows(ck):
+    """Fetch YT Music library playlist rows with the given cookie dict."""
+    import innertube as _itb
+    return _itb.get_library_playlists(ck) or []
+
+
 class App:
     def __init__(self, root):
         self.root = root
@@ -1924,6 +1969,13 @@ class App:
                          % (getattr(_yd.version, "__version__", "?"),
                             DEN_PATH, os.environ.get("JS_RUNTIMES"),
                             _tf.gettempdir()))
+                    try:
+                        import importlib.util as _ilu
+                        _dbg("SELFTEST crypto=%s"
+                             % ("present" if _ilu.find_spec("Crypto")
+                                else "MISSING: encrypted cookies unreadable"))
+                    except Exception:
+                        pass
                     try:
                         _pv = _ssp.run([DEN_PATH, "--version"],
                                        capture_output=True, timeout=30)
@@ -4778,17 +4830,18 @@ class App:
             try:
                 bc_ok = False
                 hdr = ""
+                ytm_dead = False
+                _ck = {}
+                state = {"rows": [], "src": "", "dead": False, "diag": [],
+                         "ck": None}
                 try:
                     import browser_cookies as _bc
-                    # prefer the embedded-webview cookie file (what the user
-                    # actually logged into via the app) over system-browser cookies
-                    _ck = _bc.yt_cookies_dict_from_file()
+                    _ck = _bc.yt_cookies_dict_from_file() or {}
                     if _ck:
-                        hdr = "; ".join("%s=%s" % (k, v) for k, v in _ck.items() if v)
+                        hdr = "; ".join("%s=%s" % (k, v)
+                                        for k, v in _ck.items() if v)
                         bc_ok = True
-                    else:
-                        hdr = _bc.youtube_cookie_header() or ""
-                        bc_ok = bool(hdr)
+                    _dbg("ytm crypto: %s" % (_bc.crypto_status() or "ok"))
                 except Exception:
                     pass
                 # Fetch library + guide in PARALLEL — the old sequential chain
@@ -4799,17 +4852,42 @@ class App:
                 guide_names = []
 
                 def _fetch_lib():
+                    # resolve the cookie source INSIDE the worker so the guide
+                    # fetch stays parallel. Chain: LIVE embedded webview DB ->
+                    # jar export -> complete system-browser set. The jar is only
+                    # a snapshot of the webview session; a 30-day-old one serves
+                    # the logged-out shell even while a browser session is alive.
                     out = []
-                    if bc_ok:
+                    try:
+                        import browser_cookies as _bc
+                        sources = []
                         try:
-                            import innertube as _itb2
-                            for plp in _itb2.get_library_playlists(_ck):
-                                out.append({"name": plp.get("title", "?"),
-                                            "owner": "YT Music",
-                                            "id": plp.get("playlistId", ""),
-                                            "type": "ytm"})
+                            sources.append(
+                                ("webview", _bc.yt_cookies_dict_webview()))
                         except Exception:
                             pass
+                        try:
+                            sources.append(
+                                ("jar", _bc.yt_cookies_dict_from_file()))
+                        except Exception:
+                            pass
+                        try:
+                            sources.append(
+                                ("browser", _bc.yt_cookies_dict_complete()))
+                        except Exception:
+                            pass
+                        rows, ckw, src, diag, dead = _pick_ytm_cookie_source(
+                            sources, _ytm_fetch_lib_rows)
+                        state["rows"], state["src"] = rows, src
+                        state["dead"], state["diag"] = dead, diag
+                        state["ck"] = ckw
+                        for p in rows:
+                            out.append({"name": p.get("title", "?"),
+                                        "owner": "YT Music",
+                                        "id": p.get("playlistId", ""),
+                                        "type": "ytm"})
+                    except Exception:
+                        pass
                     return out
 
                 def _fetch_guide():
@@ -4855,6 +4933,17 @@ class App:
                     f_lib, f_guide = ex.submit(_fetch_lib), ex.submit(_fetch_guide)
                     lib = f_lib.result()
                     guide_names = f_guide.result()
+                if state["rows"]:
+                    bc_ok = True
+                    _ck = state["ck"] or _ck
+                ytm_dead = state["dead"]
+                try:
+                    _dbg("ytm library: rows=%d dead=%s src=%s %s"
+                         % (len(lib), ytm_dead, state["src"] or "-",
+                            ("| " + "; ".join(state["diag"]))
+                            if state["diag"] else ""))
+                except Exception:
+                    pass
 
                 # premium library first, then guide extras, then mixes fallback.
                 seen_pids = {pl["id"] for pl in lib}
@@ -4864,10 +4953,12 @@ class App:
                                     "id": pid, "type": "ytm"})
                 if lib:
                     sections.append(("📚 Your library", lib))
+                elif ytm_dead:
+                    sections.append(("\u26a0 YouTube session expired \u2014 Login \u2192 YouTube to refresh", []))
                 elif bc_ok:
                     sections.append(("📚 Your library (empty — like or add playlists)", []))
                 else:
-                    sections.append(("⚠ Sign into YouTube to see your library", []))
+                    sections.append(("\u26a0 Sign into YouTube to see your library", []))
                 for sec_name, pl_id in [("Trending", "PLrAXtmErZgOdP_8GztsuKi9nrraNbKKp4"),
                                          ("Top ~ New Releases", "PL4fGSI1pDJn6puJdseH2Rt9sMvt9E2M4i")]:
                     sections.append((f"\u2728 {sec_name}", [

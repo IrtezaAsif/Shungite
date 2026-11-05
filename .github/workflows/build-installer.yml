@@ -92,4 +92,9 @@ jobs:
         run: |
           $tag = "${env:GITHUB_REF}" -replace 'refs/tags/', ''
           $setup = Get-ChildItem dist -Filter *.exe | Select-Object -First 1
+          gh release view $tag --repo IrtezaAsif/Shungite 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Release $tag already exists (published via API with verified assets) - skipping release create."
+            exit 0
+          }
           gh release create $tag $setup.FullName --title "Shungite $tag" --generate-notes --repo IrtezaAsif/Shungite

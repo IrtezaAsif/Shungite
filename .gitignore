@@ -11,8 +11,10 @@ venv/
 build_venv/
 .venv/
 
-# local test scratch (kept out of the repo deliberately)
-test_*.py
+# local test scratch at repo root (kept out of the repo deliberately);
+# tests/ holds the tracked regression suite (narrowed 2026-11-05 after the
+# suite was silently ignored by the old broad pattern)
+/test_*.py
 z*.py
 headless_*.py
 lyric_backfill*.py

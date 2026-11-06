@@ -1836,12 +1836,55 @@ def _post_download_fixups(music, want_fn, track, artist, res_title="",
         pass
 
 
+def _build_ytm_sources(bc, jar_path=None, webview_profile=None):
+    """Resolve the YTM cookie tiers: live embedded webview DB -> jar export
+    -> complete system-browser set (the user's 2026-11-05 directive: the
+    embedded browser is the PRIMARY login surface; the jar is only a
+    snapshot of that DB and goes stale server-side). A tier that THROWS
+    becomes a first-class diagnostic instead of silently vanishing from
+    the candidate list (2026-11-06 YTM audit). Explicit paths from PEAK
+    keep the jar on ONE canonical file - _data_file('.peak_yt_cookies.txt'),
+    the same file the yt-dlp cookie args, _import_cookies and the transfer
+    auth check use; the browser_cookies defaults (~/.peak_yt_cookies.txt)
+    are the legacy home location that split-brained the session state
+    (two live jars with different sizes/mtimes, confirmed 2026-11-06)."""
+    sources, tier_diag = [], []
+    try:
+        sources.append(("webview", bc.yt_cookies_dict_webview(webview_profile)))
+    except Exception as _e:
+        tier_diag.append("webview: source error: %s" % type(_e).__name__)
+    try:
+        sources.append(("jar", bc.yt_cookies_dict_from_file(jar_path)))
+    except Exception as _e:
+        tier_diag.append("jar: source error: %s" % type(_e).__name__)
+    try:
+        sources.append(("browser", bc.yt_cookies_dict_complete()))
+    except Exception as _e:
+        tier_diag.append("browser: source error: %s" % type(_e).__name__)
+    return sources, tier_diag
+
+
+def _yt_cookie_paths():
+    """Every location a YouTube cookie jar may live: the canonical
+    DATA_DIR file and the legacy home file. _yt_logout clears ALL of them
+    (it used to clear the same DATA_DIR path twice, leaving a live legacy
+    jar behind - 2026-11-06 YTM audit)."""
+    paths = [_data_file(".peak_yt_cookies.txt"),
+             os.path.join(os.path.expanduser("~"), ".peak_yt_cookies.txt")]
+    out, seen = [], set()
+    for p in paths:
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
+
 def _pick_ytm_cookie_source(sources, fetch):
     """Pick the first cookie source whose YT Music library session is ALIVE.
 
     sources: ordered [(tag, cookies_dict), ...] — webview jar first, complete
     browser set as fallback. fetch: cookies_dict -> playlist rows.
-    Returns (rows, ck_used, tag_used, diag, session_dead). Never raises.
+    Returns (rows, ck_used, tag_used, diag, session_dead, net_fail). Never raises.
     Diagnostics carry tags/states/counts only — never cookie values.
 
     The liveness oracle is the library response shape itself (innertube sets
@@ -1852,27 +1895,38 @@ def _pick_ytm_cookie_source(sources, fetch):
     import innertube as _itb
     rows, diag, used_ck, used_tag = [], [], None, ""
     dead = False
+    net_fail = False
     for tag, ck in sources:
         if not ck:
+            diag.append("%s: no cookies" % tag)
             continue
         try:
+            if hasattr(_itb, "_LAST_ERROR"):
+                _itb._LAST_ERROR = ""
             rows = fetch(ck) or []
-        except Exception:
+        except Exception as _e:
             rows = []
+            diag.append("%s: fetch error: %s" % (tag, type(_e).__name__))
+            dead = True
+            continue
         state = getattr(_itb, "_LAST_ERROR", "") or ""
         if rows:
             diag.append("%s: ok rows=%d" % (tag, len(rows)))
-            return rows, ck, tag, diag, False
+            return rows, ck, tag, diag, False, False
         if "alive but empty" in state:
             diag.append("%s: %s" % (tag, state))
-            return [], ck, tag, diag, False
+            return [], ck, tag, diag, False, False
         if "logged-out" in state:
             diag.append("%s: %s" % (tag, state))
             dead = True
             continue
+        if "browse failed" in state:
+            diag.append("%s: %s" % (tag, state))
+            net_fail = True
+            continue
         diag.append("%s: %s" % (tag, state or "no rows"))
         dead = True
-    return [], used_ck, used_tag, diag, dead
+    return [], used_ck, used_tag, diag, dead, net_fail
 
 
 def _ytm_fetch_lib_rows(ck):
@@ -4410,7 +4464,8 @@ class App:
         # Auth check: need YT Music authed cookies (SAPISID + __Secure-1PSID)
         try:
             import browser_cookies as _bc
-            _ck = _bc.yt_cookies_dict_from_file()
+            _ck = _bc.yt_cookies_dict_from_file(
+                _data_file(".peak_yt_cookies.txt"))
         except Exception:
             _ck = {}
         if not (_ck.get("SAPISID") and _ck.get("__Secure-1PSID")):
@@ -5188,10 +5243,11 @@ class App:
                 ytm_dead = False
                 _ck = {}
                 state = {"rows": [], "src": "", "dead": False, "diag": [],
-                         "ck": None}
+                         "net": False, "ck": None}
                 try:
                     import browser_cookies as _bc
-                    _ck = _bc.yt_cookies_dict_from_file() or {}
+                    _ck = _bc.yt_cookies_dict_from_file(
+                        _data_file(".peak_yt_cookies.txt")) or {}
                     if _ck:
                         hdr = "; ".join("%s=%s" % (k, v)
                                         for k, v in _ck.items() if v)
@@ -5215,34 +5271,25 @@ class App:
                     out = []
                     try:
                         import browser_cookies as _bc
-                        sources = []
-                        try:
-                            sources.append(
-                                ("webview", _bc.yt_cookies_dict_webview()))
-                        except Exception:
-                            pass
-                        try:
-                            sources.append(
-                                ("jar", _bc.yt_cookies_dict_from_file()))
-                        except Exception:
-                            pass
-                        try:
-                            sources.append(
-                                ("browser", _bc.yt_cookies_dict_complete()))
-                        except Exception:
-                            pass
-                        rows, ckw, src, diag, dead = _pick_ytm_cookie_source(
-                            sources, _ytm_fetch_lib_rows)
+                        sources, tier_diag = _build_ytm_sources(
+                            _bc,
+                            jar_path=_data_file(".peak_yt_cookies.txt"),
+                            webview_profile=_data_file(".peak_webview"))
+                        rows, ckw, src, diag, dead, net_fail = (
+                            _pick_ytm_cookie_source(
+                                sources, _ytm_fetch_lib_rows))
                         state["rows"], state["src"] = rows, src
-                        state["dead"], state["diag"] = dead, diag
+                        state["dead"], state["diag"] = dead, (tier_diag + diag)
+                        state["net"] = net_fail
                         state["ck"] = ckw
                         for p in rows:
                             out.append({"name": p.get("title", "?"),
                                         "owner": "YT Music",
                                         "id": p.get("playlistId", ""),
                                         "type": "ytm"})
-                    except Exception:
-                        pass
+                    except Exception as _e:
+                        _dbg("ytm library fetch FAILED: %s: %s"
+                             % (type(_e).__name__, str(_e)[:50]))
                     return out
 
                 def _fetch_guide():
@@ -5292,6 +5339,7 @@ class App:
                     bc_ok = True
                     _ck = state["ck"] or _ck
                 ytm_dead = state["dead"]
+                ytm_net = state["net"]
                 try:
                     _dbg("ytm library: rows=%d dead=%s src=%s %s"
                          % (len(lib), ytm_dead, state["src"] or "-",
@@ -5310,6 +5358,8 @@ class App:
                     sections.append(("📚 Your library", lib))
                 elif ytm_dead:
                     sections.append(("\u26a0 YouTube session expired \u2014 Login \u2192 YouTube to refresh", []))
+                elif ytm_net:
+                    sections.append(("\u26a0 couldn't reach YouTube Music \u2014 check your connection", []))
                 elif bc_ok:
                     sections.append(("📚 Your library (empty — like or add playlists)", []))
                 else:
@@ -8770,7 +8820,8 @@ class App:
                     fg=GOLD))
                 try:
                     import browser_cookies as _bc
-                    n = _bc.export_webview_cookies(profile)
+                    n = _bc.export_webview_cookies(
+                        profile, out_file=_data_file(".peak_yt_cookies.txt"))
                     self._ui(lambda: self._loginstat.config(
                         text="YouTube logged in (%s cookies) - 256k ready" % n,
                         fg="#1DB954"))
@@ -8799,9 +8850,10 @@ class App:
         profile = _data_file(".peak_webview")
         cookie_file = _data_file(".peak_yt_cookies.txt")
 
-        # 1) remove the exported cookies.txt
-        for cf in (cookie_file,
-                   _data_file(".peak_yt_cookies.txt")):
+        # 1) remove the exported cookies.txt - ALL known locations (the
+        # legacy home jar used to survive logout: the old tuple listed the
+        # same DATA_DIR path twice - 2026-11-06 YTM audit)
+        for cf in _yt_cookie_paths():
             try:
                 if _os.path.exists(cf):
                     _os.remove(cf)

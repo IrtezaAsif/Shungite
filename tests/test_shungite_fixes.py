@@ -418,7 +418,7 @@ def test_ytm_source_fallback_jar_dead_browser_alive():
         inn._LAST_ERROR = ""
         return [{"playlistId": "VLPLx", "title": "Anime Mix"}]
 
-    rows, ck, tag, diag, dead = peak._pick_ytm_cookie_source(
+    rows, ck, tag, diag, dead, _net = peak._pick_ytm_cookie_source(
         [("jar", {"src": "jar"}), ("browser", {"src": "browser"})], fetch)
     assert calls == ["jar", "browser"]
     assert tag == "browser" and len(rows) == 1 and dead is False
@@ -429,7 +429,7 @@ def test_ytm_source_fallback_both_dead():
     def fetch(ck):
         inn._LAST_ERROR = "logged-out (server sign-in CTA)"
         return []
-    rows, ck, tag, diag, dead = peak._pick_ytm_cookie_source(
+    rows, ck, tag, diag, dead, _net = peak._pick_ytm_cookie_source(
         [("jar", {"src": "jar"}), ("browser", {"src": "browser"})], fetch)
     assert rows == [] and tag == "" and dead is True
     assert len(diag) == 2
@@ -439,6 +439,6 @@ def test_ytm_source_chain_stops_on_alive_empty():
     def fetch(ck):
         inn._LAST_ERROR = "alive but empty library"
         return []
-    rows, ck, tag, diag, dead = peak._pick_ytm_cookie_source(
+    rows, ck, tag, diag, dead, _net = peak._pick_ytm_cookie_source(
         [("jar", {"src": "jar"}), ("browser", {"src": "browser"})], fetch)
     assert rows == [] and dead is False and tag == "jar"

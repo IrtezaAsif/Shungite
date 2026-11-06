@@ -219,12 +219,50 @@ _load_lib_index: files made earlier TODAY by the old build are legacy-order
 they never reach this parse. Anchor = midnight tonight, not now."""
 
 
+_AUDIO_EXTS = (".opus", ".mp3", ".m4a", ".flac", ".ogg", ".wav")
+
+
+def _actual_audio_file(music, want_fn):
+    """The audio file a finished download actually produced for want_fn -
+    newest mtime wins (a format re-download must beat a stale same-stem
+    file), glob-escaped so [Official Video]-style stems match (the
+    filename sanitizer keeps [ ] chars; a naive glob treats them as a
+    character class). Returns the absolute path or None; callers fall
+    back to the legacy want_fn + '.opus' guess. The fixups pipeline used
+    to hard-code .opus, silently skipping tags/lyrics/genre and writing
+    wrong lib-index keys for M4A/MP3 downloads (found 2026-11-06)."""
+    import glob as _g
+    _hits = []
+    for _ext in _AUDIO_EXTS:
+        _hits.extend(_g.glob(_g.escape(os.path.join(music, want_fn)) + _ext))
+    if not _hits:
+        return None
+    return max(_hits, key=os.path.getmtime)
+
+
+def _dl_title_for(track, artist, res_title="", res_channel=""):
+    """The download filename stem for retry/missing paths: an authoritative
+    track name wins (track-first - a Spotify track name must not be
+    overridden by a parsed video title); else parse the video title
+    (Artist - Song) with the channel as the artist fallback.
+    A URL must NEVER become a filename."""
+    if track:
+        return want_filename(track, artist)
+    if res_title and not looks_like_url(res_title):
+        _s, _a = _split_video_title(res_title, res_channel)
+        if _s:
+            return want_filename(_s, _a)
+    return want_filename(track or "", artist or "")
+
+
 def looks_like_url(s):
     """True if s is a URL — a URL must NEVER become a filename (the old
     Single tab passed the link itself as the download title)."""
     s = (s or "").strip().lower()
     return (s.startswith(("http://", "https://", "www."))
-            or "youtu.be/" in s)
+            or "youtu.be/" in s
+            or "youtube.com/" in s
+            or "music.youtube.com/" in s)
 
 
 def heal_cookie_paths(cfg, save=True):
@@ -533,7 +571,9 @@ def download_one(title, url, save_path, dtype, quality, speed_limit,
                  browser=None, download_archive=None, cookiefile=None,
                  meta_artist="", yt_url="", subs=False):
     """Download one track — SINGLE yt-dlp call, no separate info extraction.
-    The title from search is used for status display, yt-dlp handles the filename."""
+    The caller's title (a cleaned Song - Artist stem when known) names the
+    file via outtmpl; URL-ish titles fall back to yt-dlp's own video title -
+    a URL must NEVER become a filename (looks_like_url guard)."""
     _sm = _source_mode()
     if _sm == "ytmusic":
         url = url.replace("www.youtube.com", "music.youtube.com")
@@ -1746,11 +1786,26 @@ def sweep_orphan_sidecars(music_dir):
 
 def _post_download_fixups(music, want_fn, track, artist, res_title="",
                           genre="", yt_url=""):
-    """Synchronous post-download guarantee, shared by EVERY tab (was batch-CSV
-    only): Spotify title/artist/genre tags, timed .lrc from YouTube subtitles,
-    LRClib fallback keyed by real duration, lyrics embedded into the file
-    tags, leftover sidecars cleaned up. Runs in the worker thread."""
-    actual = want_fn + ".opus"
+    """Synchronous post-download guarantee (the download tabs call it; the
+    retry paths still tag only via their own index writes): Spotify
+    title/artist/genre tags, timed .lrc from YouTube subtitles, LRClib
+    fallback keyed by real duration, lyrics embedded into the file tags,
+    leftover sidecars cleaned up. Extension-agnostic since 2026-11-06:
+    the actual file is resolved via _actual_audio_file (any audio ext),
+    yt-title-named files are pre-renamed before tagging, and the legacy
+    .opus assumption is gone. Runs in the worker thread."""
+    _found = _actual_audio_file(music, want_fn)
+    if _found is None and res_title and not looks_like_url(res_title):
+        _yt_stem = want_filename(res_title, "")
+        _found = _actual_audio_file(music, _yt_stem)
+        if _found is not None:
+            _aext = os.path.splitext(_found)[1] or ".opus"
+            try:
+                os.replace(_found, os.path.join(music, want_fn + _aext))
+                _found = os.path.join(music, want_fn + _aext)
+            except Exception:
+                pass
+    actual = os.path.basename(_found) if _found else (want_fn + ".opus")
     _f = os.path.join(music, actual)
     if not genre:
         try:
@@ -3494,10 +3549,12 @@ class App:
                         "  ✓ %s — %s" % (artist, track)))
                 except Exception:
                     pass
-                actual = want_fn + ".opus"
                 _post_download_fixups(music, want_fn, track, artist,
                                       res.get("title", ""), genre=genre,
                                       yt_url=res.get("url", ""))
+                actual = os.path.basename(
+                    _actual_audio_file(music, want_fn)
+                    or (want_fn + ".opus"))
                 try:
                     old_guess = re.sub(r'[<>:"/\\|?*]', "_",
                                        res.get("title", "")).strip(" .")[:200] + ".opus"
@@ -3511,7 +3568,7 @@ class App:
                 with lock:
                     index[actual] = {"track": track, "artist": artist,
                                      "uri": _vid_from_url(res.get("url", ""))}
-                    file_norms[self._normalize_match(actual[:-5])] = actual
+                    file_norms[self._normalize_match(os.path.splitext(actual)[0])] = actual
                     stats["ok"] += 1
                     if stats["ok"] % save_index_every == 0:
                         try:
@@ -4362,7 +4419,8 @@ class App:
                         got = False
                         for res in results or []:
                             s, _err = download_one(
-                                res["title"], res["url"], music,
+                                _dl_title_for(name, artists),
+                                res["url"], music,
                                 self._spfmt.get(), qual, 0, browser=browser,
                                 cancel_event=ev,
                                 cookiefile=self._yt_cookiefile(),
@@ -4375,7 +4433,9 @@ class App:
                                     music, want_fn, name, artists,
                                     res.get("title", ""), genre=genre,
                                     yt_url=res.get("url", ""))
-                                actual_fn = want_fn + ".opus"
+                                actual_fn = os.path.basename(
+                                    _actual_audio_file(music, want_fn)
+                                    or (want_fn + ".opus"))
                                 with self._lib_lock:
                                     index[actual_fn] = {"track": name,
                                                         "artist": artists,
@@ -4987,7 +5047,9 @@ class App:
                                 subs=self.cfg.get("fetch_subtitles", False))
                             if state == "ok":
                                 dl_ok += 1
-                                actual_fn = want_fn + ".opus"
+                                actual_fn = os.path.basename(
+                                    _actual_audio_file(music, want_fn)
+                                    or (want_fn + ".opus"))
                                 # if the file came out under the youtube title
                                 # (custom outtmpl etc), rename it to Artist-Title
                                 yt_guess = re.sub(r'[<>:\"/\\|?*]', "_",
@@ -5981,8 +6043,10 @@ class App:
                     q = f"{ttitle} {rep_artist}".strip()
                     res = search_youtube(q, 2, browser)
                     for rr in res or []:
-                        s, _e = download_one(rr["title"], rr["url"], music,
-                                             "audio", qual, 0, browser=browser)
+                        s, _e = download_one(
+                            _dl_title_for(ttitle, rep_artist),
+                            rr["url"], music,
+                            "audio", qual, 0, browser=browser)
                         if s == "ok":
                             ok += 1
                             break
@@ -8086,14 +8150,16 @@ class App:
                 results = search_youtube(q, 2, browser)
                 for res in results or []:
                     s, _err = download_one(
-                        res["title"], res["url"], music,
+                        _dl_title_for(track, artist), res["url"], music,
                         getattr(self, "_bfmt", None).get() if hasattr(self, "_bfmt") else "audio",
                         qual, 0, browser=browser,
                         cookiefile=self._yt_cookiefile(),
                         subs=self.cfg.get("fetch_subtitles", False))
                     if s == "ok":
-                        actual_fn = re.sub(r'[<>:"/\\|?*]', "_",
-                                          res["title"]).strip(" .")[:200] + ".opus"
+                        _want = _dl_title_for(track, artist)
+                        actual_fn = os.path.basename(
+                            _actual_audio_file(music, _want)
+                            or (_want + ".opus"))
                         with self._lib_lock:
                             index[actual_fn] = {"track": track, "artist": artist,
                                                 "uri": _vid_from_url(res.get("url", ""))}
@@ -8278,15 +8344,17 @@ class App:
                     results = search_youtube(it["q"], 2, browser)
                     got = False
                     for res in results or []:
+                        _want = _dl_title_for(it["title"], it.get("artist", ""), res.get("title", ""), res.get("channel") or "")
                         s, _err = download_one(
-                            res["title"], res["url"], music,
+                            _want, res["url"], music,
                             self._spfmt.get(), qual, 0, browser=browser,
                             cancel_event=ev,
                             cookiefile=self._yt_cookiefile(),
                             subs=self.cfg.get("fetch_subtitles", False))
                         if s == "ok":
-                            actual_fn = re.sub(r'[<>:"/\\|?*]', "_",
-                                              res["title"]).strip(" .")[:200] + ".opus"
+                            actual_fn = os.path.basename(
+                                _actual_audio_file(music, _want)
+                                or (_want + ".opus"))
                             with self._lib_lock:
                                 index[actual_fn] = {"track": it["title"],
                                                     "artist": "",
@@ -8543,7 +8611,8 @@ class App:
                     got = False
                     for r in res or []:
                         s, e2 = download_one(
-                            r["title"], r["url"], music, "audio", qual, 0,
+                            _dl_title_for(t["title"], t["artist"]),
+                            r["url"], music, "audio", qual, 0,
                             browser=browser)
                         if s == "ok":
                             ok += 1

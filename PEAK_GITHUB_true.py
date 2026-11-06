@@ -271,7 +271,7 @@ def _native_sub_langs(title, meta_artist=""):
     except Exception:
         det = ""
     return (["und"] + ([det] if det and det != "en" else [])
-            + ["en.*", "en"])
+            + ["en"])
 
 
 _SEG_DESCRIPTOR_RE = re.compile(
@@ -605,13 +605,11 @@ def download_one(title, url, save_path, dtype, quality, speed_limit,
         opts["format"] = cf
     if _cfg_get("restrict_filenames"):
         opts["restrictfilenames"] = True
-    # subtitles / proxy / aria2c (Seal-style)
-    # `subs` (per-call) OR config both enable it; keep original-language
-    # subtitles ('und' = the video's own language) plus en variants.
-    if subs or _cfg_get("download_subtitles"):
-        opts["writesubtitles"] = True
-        opts["subtitleslangs"] = _native_sub_langs(title, meta_artist)
-        opts["writeautomaticsub"] = True
+    # subtitles: NO LONGER fetched inline with the audio (2026-11-06). The
+    # en.* fan-out wrote 4-6 .vtt per video and a caption 429 killed the
+    # whole track. Lyrics come from ensure_lyrics() post-download:
+    # LRClib first, ONE native caption as a best-effort fallback, then the
+    # description. `subs` (per-call) and download_subtitles still gate it.
     prx = (_cfg_get("proxy", "") or "").strip()
     if prx:
         opts["proxy"] = prx
@@ -789,10 +787,8 @@ def download_one(title, url, save_path, dtype, quality, speed_limit,
 
 
         current_opts = dict(opts)
-        if subs:
-            # keep the native-first list computed above; the retry path must
-            # NOT stomp subtitleslangs back to English (2026-11 fix)
-            current_opts["writesubtitles"] = True
+        # captions ride outside the audio download now (2026-11-06); retries
+        # never re-add subtitle requests
 
         for attempt in range(4):
             try:
@@ -889,21 +885,17 @@ def download_one(title, url, save_path, dtype, quality, speed_limit,
                                             pass
                                 except Exception:
                                     pass
-                                # if a .vtt landed next to the audio, convert it
-                                # into a .lrc (properly timed original-language
-                                # lyrics) BEFORE falling back to lrclib/genius
+                                # lyrics: LRClib first (right language — the
+                                # 2026-11-06 SPIN fix), then ONE native caption
+                                # as a decoupled best-effort fallback, then the
+                                # description. Nothing here can kill the track.
                                 try:
-                                    from titanium_enrich import (
-                                        vtt_to_lrc, rank_vtt_candidates,
-                                        lyric_lang, _detect_lang_from_title)
-                                    if not os.path.exists(base + ".lrc"):
-                                        _vtts = _g2.glob(base + "*.vtt")
-                                        _wl = lyric_lang() or \
-                                            _detect_lang_from_title(title or "")
-                                        for _cand in rank_vtt_candidates(
-                                                _vtts, _wl):
-                                            if vtt_to_lrc(_cand, base + ".lrc"):
-                                                break
+                                    ensure_lyrics(base, _yu or url or "",
+                                                  title or "", _ma or "",
+                                                  cookiefile=_cf,
+                                                  captions=bool(
+                                                      subs or _cfg_get(
+                                                          "download_subtitles")))
                                 except Exception:
                                     pass
                                 need = (not os.path.exists(base + ".lrc")
@@ -1551,8 +1543,159 @@ def _match_track(track, artist, browser, prefs=None, n=8, dur_s=None):
 
 
 
+def fetch_caption_vtt(url, base, title, meta_artist="", cookiefile=None):
+    """Best-effort caption fetch — exactly ONE track, chosen from the video's
+    own inventory, decoupled from the audio download. Returns the path of the
+    single .vtt written, or "". Any failure (429, no native track, network)
+    returns "" — a caption problem can never kill a download again."""
+    try:
+        import yt_dlp as _y
+        import titanium_enrich as _ten
+        want = ""
+        try:
+            want = _ten._detect_lang_from_title(title or "",
+                                                meta_artist or "") or ""
+        except Exception:
+            want = ""
+        opts = {"quiet": True, "no_warnings": True, "socket_timeout": 20,
+                "skip_download": True, "outtmpl": base + ".%(ext)s"}
+        if cookiefile and os.path.isfile(cookiefile):
+            opts["cookiefile"] = cookiefile
+        with _y.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+        if not info:
+            return ""
+        code, is_auto = _ten.pick_caption_code(info, want_lang=want)
+        if not code:
+            return ""
+        opts["writesubtitles"] = True
+        opts["writeautomaticsub"] = bool(is_auto)
+        opts["subtitleslangs"] = [code]
+        with _y.YoutubeDL(opts) as ydl:
+            ydl.download([url])
+        import glob as _g
+        cand = sorted(_g.glob(_g.escape(base) + "*.vtt"), key=len)
+        return cand[0] if cand else ""
+    except Exception:
+        return ""
+
+
+def ensure_lyrics(base, url, title, artist="", cookiefile=None,
+                  captions=None):
+    """One lyrics pipeline for every tab, in the right order (2026-11-06):
+    1. LRClib — a lyrics database, right language, synced preferred.
+    2. YouTube captions — ONE native track, decoupled best-effort fetch.
+    3. YouTube description block — plain text last resort.
+    The old order converted the caption file FIRST, so an English
+    translation of a Japanese song (Kroi SPIN) blocked LRClib's lyrics
+    behind the .lrc-exists early return. Returns the source tag."""
+    try:
+        if os.path.exists(base + ".lrc") and \
+                os.path.getsize(base + ".lrc") > 50:
+            return "existing"
+        import titanium_enrich as _ten
+        dur = getattr(_ten, "_last_dur", None)
+        if not dur:
+            # duration-keyed LRClib matching must work on EVERY path, not
+            # only where download_one happened to stash it (2026-11-06):
+            # read the real length from the audio file itself
+            for _ext in (".opus", ".m4a", ".mp3", ".mp4", ".ogg",
+                         ".flac", ".wav", ".webm"):
+                if os.path.exists(base + _ext):
+                    try:
+                        import mutagen as _mg
+                        _af = _mg.File(base + _ext)
+                        if _af is not None and _af.info and \
+                                getattr(_af.info, "length", None):
+                            dur = int(round(_af.info.length))
+                    except Exception:
+                        dur = None
+                    break
+        if _ten.fetch_lyrics(artist or "", title or "", base,
+                             duration_s=dur):
+            return "lrclib"
+        if captions is None:
+            captions = bool(_cfg_get("download_subtitles")
+                            or _cfg_get("fetch_subtitles"))
+        if captions and url:
+            vtt = fetch_caption_vtt(url, base, title, artist,
+                                    cookiefile=cookiefile)
+            if vtt:
+                _wl = _ten.lyric_lang() or \
+                    _ten._detect_lang_from_title(title or "", artist or "")
+                for _cand in _ten.rank_vtt_candidates([vtt], _wl):
+                    if _ten.vtt_to_lrc(_cand, base + ".lrc"):
+                        return "caption"
+        if url and _ten.fetch_lyrics_youtube(url, base):
+            return "youtube-desc"
+        return ""
+    except Exception:
+        return ""
+
+
+def sweep_orphan_sidecars(music_dir):
+    """Delete download litter that no completed track claims: yt-dlp partials
+    (.part/.ytdl/.temp.*), .info.json/.segments.json, and thumbnails or
+    subtitles whose stem has no sibling audio. A .vtt whose audio exists is
+    removed only when the .lrc was already produced (it is spent). Never
+    touches audio, .lrc, .m3u, .txt, .csv, or folders. Returns the removed
+    count. Run at batch END (all workers joined) — never mid-batch, so a
+    live worker's .part can never be swept."""
+    removed = 0
+    try:
+        if not music_dir or not os.path.isdir(music_dir):
+            return 0
+        audio_exts = (".opus", ".m4a", ".mp3", ".mp4", ".ogg", ".flac",
+                      ".wav", ".webm")
+        files = os.listdir(music_dir)
+        stems_audio = set()
+        for f in files:
+            if f.lower().endswith(audio_exts):
+                stems_audio.add(os.path.splitext(f)[0].lower())
+        for f in files:
+            p = os.path.join(music_dir, f)
+            if not os.path.isfile(p):
+                continue
+            low = f.lower()
+            stem = os.path.splitext(f)[0]
+            if low.endswith((".part", ".ytdl")) or ".temp." in low \
+                    or low.endswith(".info.json") \
+                    or low.endswith(".segments.json"):
+                try:
+                    os.remove(p)
+                    removed += 1
+                except OSError:
+                    pass
+                continue
+            ext = os.path.splitext(low)[1]
+            if ext in (".vtt", ".webp", ".jpg", ".jpeg", ".png"):
+                base_stem = stem
+                parts = stem.rsplit(".", 1)
+                if len(parts) == 2 and parts[1] and len(parts[1]) <= 8 \
+                        and parts[1].replace("-", "").isalnum():
+                    base_stem = parts[0]
+                claimed = (base_stem.lower() in stems_audio
+                           or stem.lower() in stems_audio)
+                if not claimed:
+                    try:
+                        os.remove(p)
+                        removed += 1
+                    except OSError:
+                        pass
+                elif ext == ".vtt" and os.path.exists(
+                        os.path.join(music_dir, base_stem + ".lrc")):
+                    try:
+                        os.remove(p)
+                        removed += 1
+                    except OSError:
+                        pass
+    except Exception:
+        pass
+    return removed
+
+
 def _post_download_fixups(music, want_fn, track, artist, res_title="",
-                          genre=""):
+                          genre="", yt_url=""):
     """Synchronous post-download guarantee, shared by EVERY tab (was batch-CSV
     only): Spotify title/artist/genre tags, timed .lrc from YouTube subtitles,
     LRClib fallback keyed by real duration, lyrics embedded into the file
@@ -1579,15 +1722,8 @@ def _post_download_fixups(music, want_fn, track, artist, res_title="",
         pass
     _base = os.path.join(music, want_fn)
     try:
-        if not os.path.exists(_base + ".lrc"):
-            import glob as _gl
-            from titanium_enrich import (vtt_to_lrc, rank_vtt_candidates,
-                                         lyric_lang, _detect_lang_from_title)
-            _vtts = _gl.glob(_gl.escape(_base) + "*.vtt")
-            _wl = lyric_lang() or _detect_lang_from_title(track, artist)
-            for _cand in rank_vtt_candidates(_vtts, _wl):
-                if vtt_to_lrc(_cand, _base + ".lrc"):
-                    break
+        ensure_lyrics(_base, yt_url or "", track or "", artist or "",
+                      captions=_cfg_get("fetch_subtitles", False))
     except Exception:
         pass
     try:
@@ -2378,7 +2514,8 @@ class App:
                 # video lanes skip rather than no-op on a nonexistent path
                 try:
                     _post_download_fixups(self._sdir.get(), _name, _song,
-                                          _art, res_title=_vt or "")
+                                          _art, res_title=_vt or "",
+                                          yt_url=url)
                 except Exception:
                     pass
             def _summarize():
@@ -3108,7 +3245,8 @@ class App:
                     pass
                 actual = want_fn + ".opus"
                 _post_download_fixups(music, want_fn, track, artist,
-                                      res.get("title", ""), genre=genre)
+                                      res.get("title", ""), genre=genre,
+                                      yt_url=res.get("url", ""))
                 try:
                     old_guess = re.sub(r'[<>:"/\\|?*]', "_",
                                        res.get("title", "")).strip(" .")[:200] + ".opus"
@@ -3265,10 +3403,19 @@ class App:
                     break
                 ev.wait(0.3)
         finally:
-            ex.shutdown(wait=False, cancel_futures=True)
+            # wait=True: on cancel, let running workers finish their current
+            # item so the orphan sweep below can never race a live .part
+            ex.shutdown(wait=True, cancel_futures=True)
         try:
             fail_fh.flush()
             fail_fh.close()
+        except Exception:
+            pass
+        try:
+            _sw = sweep_orphan_sidecars(music)
+            if _sw:
+                self._gui_queue().put(("blog",
+                    "\U0001F9F9 %d orphan files cleaned" % _sw))
         except Exception:
             pass
         self._gui_queue().put(("bstat",
@@ -3970,7 +4117,8 @@ class App:
                                          if len(tracks[i]) > 3 else "")
                                 _post_download_fixups(
                                     music, want_fn, name, artists,
-                                    res.get("title", ""), genre=genre)
+                                    res.get("title", ""), genre=genre,
+                                    yt_url=res.get("url", ""))
                                 actual_fn = want_fn + ".opus"
                                 with self._lib_lock:
                                     index[actual_fn] = {"track": name,

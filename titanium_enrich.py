@@ -270,44 +270,150 @@ def fetch_lyrics_youtube(url_or_query, audio_path):
 
 
 # ── VTT -> LRC converter (timed lyrics in original language) ──────────────────
+_VTT_TAG_RE = re.compile(r"<[^>]*>")
+_VTT_MARK_RE = re.compile(
+    r"^\[(music|applause|laughter|music plays|instrumental|"
+    r"applause and music|no speech)\]$", re.I)
+_VTT_VMARK_RE = re.compile(
+    r"\[(music|applause|laughter|instrumental)\]", re.I)
+
 _VTT_TS_RE = re.compile(r"^(?:(\d{2}):)?(\d{2}):(\d{2})\.(\d{3})")
+
+
+def pick_caption_code(info, want_lang=""):
+    """Pick the ONE caption track worth downloading, from the video's own
+    inventory. Returns (code, is_auto) or (None, False).
+
+    Manual subtitle tracks are real text; in yt-dlp's automatic_captions
+    every key is a translation target EXCEPT the ASR original, which is
+    marked '*-orig'. So: the video's own language first (manual, then its
+    ASR original), then a script-detected request language the same way.
+    English is only chosen when the video is genuinely English. When no
+    native track can be identified (e.g. Ado usseewa Qp3b-RXtz4w: manual
+    ar/en/es/ko/ru/zh translations, no ja track, no ja-orig), return None
+    and let LRClib supply lyrics in the right language instead of a
+    guessed translation. 'live_chat' is never a caption track."""
+    try:
+        manual = {k: v for k, v in (info.get("subtitles") or {}).items()
+                  if k and k != "live_chat"}
+        auto = info.get("automatic_captions") or {}
+        vlang = (info.get("language") or "").split("-")[0].lower()
+        want = (want_lang or "").split("-")[0].lower()
+
+        def _origs_for(base):
+            for k in auto:
+                if k.endswith("-orig") and k.split("-")[0] == base:
+                    return k
+            return ""
+
+        if vlang and vlang != "en":
+            for k in sorted(manual, key=len):
+                if k.split("-")[0] == vlang:
+                    return (k, False)
+            o = _origs_for(vlang)
+            if o:
+                return (o, True)
+        if want and want != "en":
+            for k in sorted(manual, key=len):
+                if k.split("-")[0] == want:
+                    return (k, False)
+            o = _origs_for(want)
+            if o:
+                return (o, True)
+        origs = [k for k in auto if k.endswith("-orig")]
+        if origs:
+            return (sorted(origs, key=len)[0], True)
+        if vlang == "en":
+            if "en" in manual:
+                return ("en", False)
+            if "en" in auto:
+                return ("en", True)
+        return (None, False)
+    except Exception:
+        return (None, False)
 
 def vtt_to_lrc(vtt_path, lrc_path):
     """Convert a downloaded .vtt subtitle into a synced .lrc file.
-    Preserves the original language text and timing — this is the 'properly
-    timed subtitles in original language' path."""
+    Strips every caption artifact first: WEBVTT/NOTE/STYLE blocks, cue ids,
+    inline <c>/karaoke tags, cue settings, HTML entities, [Music]-style
+    markers, speaker marks, and rolling duplicate cues (auto-captions repeat
+    the same text across successive cues). Writes nothing and returns False
+    when nothing usable survives — the LRClib fallback then applies."""
     if not vtt_path or not os.path.exists(vtt_path):
         return False
     try:
+        import html as _html
         with open(vtt_path, encoding="utf-8", errors="replace") as f:
-            out, cur_start, cur_end, cur_text = [], None, None, []
-            for line in f:
-                line = line.rstrip("\r\n")
+            raw = f.read()
+        cues = []                       # [(start_float, text), ...]
+        cur_start = None
+        cur_text = []
+        in_note = False
+        for line in raw.splitlines():
+            line = line.rstrip("\r\n")
+            if not line.strip():
+                in_note = False         # blank line ends NOTE/STYLE blocks
+                continue
+            if in_note:
+                continue
+            if line.startswith(("NOTE", "STYLE", "REGION")):
+                in_note = True
+                continue
+            if line.startswith(("WEBVTT", "Kind:", "Language:")):
+                continue
+            if _VTT_TS_RE.match(line) and "-->" in line:
+                if cur_start is not None and cur_text:
+                    txt = " ".join(t for t in cur_text if t).strip()
+                    if txt:
+                        cues.append((cur_start, txt))
+                cur_text = []
                 m = _VTT_TS_RE.match(line)
-                if m and "-->" in line:
-                    # flush previous cue
-                    if cur_start is not None and cur_text:
-                        txt = " ".join(t for t in cur_text if t)
-                        if txt:
-                            out.append(f"[{cur_start}] {txt}")
-                    cur_text = []
-                    _h, _m, _s, _ms = m.groups()
-                    hh = int(_h) if _h is not None else 0
-                    total = (hh * 3600 + int(_m) * 60 + int(_s)
+                _h, _m, _s, _ms = m.groups()
+                hh = int(_h) if _h is not None else 0
+                cur_start = (hh * 3600 + int(_m) * 60 + int(_s)
                              + int(_ms) / 1000.0)
-                    mm2 = int(total // 60); ss2 = int(total % 60)
-                    cs  = int((total % 1) * 100)
-                    cur_start = f"{mm2:02d}:{ss2:02d}.{cs:02d}"
-                elif line and cur_start is not None and not line.startswith("WEBVTT"):
-                    cur_text.append(line)
-            if cur_start is not None and cur_text:
-                txt = " ".join(t for t in cur_text if t)
-                if txt:
-                    out.append(f"[{cur_start}] {txt}")
-        if not out:
+                continue
+            if line.strip().isdigit():
+                continue                # cue identifier line
+            if cur_start is not None:
+                t = _VTT_TAG_RE.sub(" ", line)
+                t = _html.unescape(t)
+                t = t.replace(">>", " ")
+                t = _VTT_VMARK_RE.sub(" ", t)
+                t = re.sub(r"\s+", " ", t).strip()
+                if t:
+                    cur_text.append(t)
+        if cur_start is not None and cur_text:
+            txt = " ".join(t for t in cur_text if t).strip()
+            if txt:
+                cues.append((cur_start, txt))
+        # rolling dedupe: auto-captions carry growing prefixes of the same
+        # line across successive cues — keep the longest text per overlap
+        cleaned = []
+        for st, txt in cues:
+            if _VTT_MARK_RE.match(txt):
+                continue
+            if cleaned:
+                pst, ptxt = cleaned[-1]
+                if txt == ptxt:
+                    continue
+                if txt.startswith(ptxt) or ptxt.startswith(txt):
+                    if len(txt) > len(ptxt):
+                        cleaned[-1] = (pst, txt)
+                    continue
+            cleaned.append((st, txt))
+        if len(cleaned) < 2:
+            return False                # junk-only or too thin -> LRClib wins
+        out = []
+        for st, txt in cleaned:
+            mm2 = int(st // 60)
+            ss2 = st % 60
+            out.append("[%02d:%05.2f] %s" % (mm2, ss2, txt))
+        lrc = normalize_lrc_text("\n".join(out) + "\n")
+        if not lrc or len(lrc) < 20:
             return False
         with open(lrc_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(out) + "\n")
+            f.write(lrc + "\n")
         return True
     except Exception:
         return False
@@ -316,11 +422,11 @@ def vtt_to_lrc(vtt_path, lrc_path):
 def rank_vtt_candidates(paths, want_lang=""):
     """Rank downloaded .vtt subtitle files for lyric conversion.
 
-    The song's OWN language first (the video's native captions), original
-    'und' next, any other non-English track after that, and English
-    translations DEAD LAST — an English translation of a Japanese song is
-    the wrong lyrics, never a preferred pick. Language is parsed from the
-    filename tag ('stem.ja.vtt', 'stem.en-US.vtt'), never from length."""
+    Native/und/ASR-original tracks first; every TRANSLATION code
+    ('en-ja', 'en-de-DE') and generic English after any native track —
+    an English translation of a Japanese song is the wrong lyrics, never
+    a preferred pick. Language is parsed from the filename tag
+    ('stem.ja.vtt', 'stem.en-US.vtt'), never from length."""
     import os as _os
 
     def _lang_of(p):
@@ -329,20 +435,23 @@ def rank_vtt_candidates(paths, want_lang=""):
 
     def _score(p):
         lg = _lang_of(p)
-        en = lg in ("en", "en-us", "en-gb")
-        if not want_lang:
-            if en:
-                return 0
-            return 2 if lg == "und" else 1
-        if lg == want_lang:
-            return 5
-        if want_lang and lg.startswith(want_lang):
-            return 4
-        if lg in ("und", "orig"):
-            return 3
-        if en:
+        base = lg.split("-")[0]
+        is_orig = lg.endswith("-orig") or lg == "und"
+        trans = ("-" in lg) and not is_orig
+        if want_lang:
+            wb = want_lang.split("-")[0].lower()
+            if base == wb:
+                return 6 if not trans else 5
+            if is_orig:
+                return 4
+            if not trans and base != "en":
+                return 3
             return 0
-        return 1
+        if is_orig:
+            return 4
+        if not trans and base != "en":
+            return 3
+        return 0
 
     return sorted(paths, key=lambda p: (-_score(p), len(p)))
 

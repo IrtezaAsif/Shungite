@@ -1866,6 +1866,98 @@ def _ytm_fetch_lib_rows(ck):
     return _itb.get_library_playlists(ck) or []
 
 
+def harvest_sp_dc_post_login():
+    """D1 (2026-11): post-login sp_dc harvest.
+
+    The webview captures Spotify cookies to ~/.spotify_cookies.txt; pull
+    sp_dc out of it so the libraryV3 route works immediately (the OAuth
+    /v1/me/* route hard-403s on this client ID). Never silent: every
+    outcome is logged with a reason, and a missing or empty capture falls
+    back to one live browser-cookie scan.
+    """
+    try:
+        _cp = os.path.join(os.path.expanduser("~"), ".spotify_cookies.txt")
+        _dc = sp.get_sp_dc_from_cookies_file(_cp)
+        if _dc:
+            with open(sp.SP_DC_PATH, "w", encoding="utf-8") as f:
+                f.write(_dc)
+            _dbg("sp_dc harvested post-login (size only)")
+            return True
+        try:
+            import browser_cookies as _bc
+            _dc2 = _bc.get_sp_dc()
+        except Exception:
+            _dc2 = ""
+        if _dc2:
+            with open(sp.SP_DC_PATH, "w", encoding="utf-8") as f:
+                f.write(_dc2)
+            _dbg("sp_dc harvested via live browser scan (post-login)")
+            return True
+        _dbg("sp_dc harvest FAILED: no webview capture and no browser sp_dc "
+             "- the Spotify library will look logged out")
+        return False
+    except Exception as _e:
+        _dbg("sp_dc harvest error: %s" % str(_e)[:80])
+        return False
+
+
+def refresh_stale_sp_dc(max_age_s=21600):
+    """D4 (2026-11): self-heal a stale ~/.peak_sp_dc.
+
+    stored_sp_dc() returns the cached copy whenever it exists, so a stale
+    token never heals by itself (the user's file predated their login and
+    never self-healed). Before a library refresh: if the cached sp_dc is
+    older than max_age_s (6h) or missing, try one live browser-cookie scan
+    and rewrite only on a different non-empty value. Local cookie
+    extraction only - never network.
+    """
+    import time as _tm
+    try:
+        _p = sp.SP_DC_PATH
+        _age = None
+        if os.path.isfile(_p):
+            _age = _tm.time() - os.path.getmtime(_p)
+        if _age is not None and _age <= max_age_s:
+            return False
+        try:
+            import browser_cookies as _bc
+            _dc = _bc.get_sp_dc()
+        except Exception:
+            _dc = ""
+        if not _dc:
+            return False
+        _old = ""
+        try:
+            with open(_p, encoding="utf-8", errors="replace") as f:
+                _old = f.read().strip()
+        except Exception:
+            _old = ""
+        if _dc != _old:
+            with open(_p, "w", encoding="utf-8") as f:
+                f.write(_dc)
+            _dbg("sp_dc refreshed from a live browser scan (stale=%s)"
+                 % ("yes" if _age is not None else "missing"))
+            return True
+    except Exception as _e:
+        _dbg("sp_dc stale-refresh error: %s" % str(_e)[:60])
+    return False
+
+
+def _sp_empty_message():
+    """D3 (2026-11): the Spotify tab empty-library status line must tell
+    logged-out from fetch-failed from logged-in-but-empty."""
+    if not sp.stored_sp_dc():
+        return ("\u25cf not logged in - Settings -> Login to Spotify "
+                "(or export cookies.txt)")
+    try:
+        _reason = sp.LIBV3_LAST_REASON or ""
+    except Exception:
+        _reason = ""
+    if _reason:
+        return "\u25cf library fetch failed (%s) - try Login again" % _reason[:60]
+    return "\u25cf no playlists on this account - logged in but empty"
+
+
 class App:
     def __init__(self, root):
         self.root = root
@@ -3918,6 +4010,7 @@ class App:
 
     def _sp_load(self):
         self._apply_manual_sp_cookie()
+        refresh_stale_sp_dc()
         for r in self._sptree.get_children():
             self._sptree.delete(r)
         self._spmap.clear()
@@ -3973,9 +4066,9 @@ class App:
                         fg="#1DB954")
                 else:
                     # never a silently empty tree -- say why and how to fix it
-                    self._spstat.config(
-                        text="● no playlists — Settings → Login to Spotify "
-                             "(or export cookies.txt)", fg="#e63946")
+                    # (D3 2026-11): logged-out vs fetch-failed vs empty account
+                    self._spstat.config(text=_sp_empty_message(),
+                                        fg="#e63946")
             self._ui(fill)
         threading.Thread(target=run, daemon=True).start()
 
@@ -8500,17 +8593,10 @@ class App:
                     # Spotify cookies to ~/.spotify_cookies.txt -- harvest
                     # sp_dc so the libraryV3 route works right after login
                     # (OAuth /v1/me/* hard-403s on this client ID).
-                    try:
-                        _cp = os.path.join(os.path.expanduser("~"),
-                                           ".spotify_cookies.txt")
-                        _dc = sp.get_sp_dc_from_cookies_file(_cp)
-                        if _dc:
-                            with open(sp.SP_DC_PATH, "w",
-                                      encoding="utf-8") as f:
-                                f.write(_dc)
-                            _dbg("sp_dc harvested post-login (size only)")
-                    except Exception:
-                        pass
+                    # (D1 2026-11): extracted - never silent, and a
+                    # missing webview capture falls back to one browser
+                    # scan instead of leaving a stale sp_dc in place.
+                    harvest_sp_dc_post_login()
                 else:
                     self._ui(lambda: self._loginstat.config(
                         text="✗ Spotify login not completed",
@@ -8545,16 +8631,7 @@ class App:
             self._loginstat.config(text=f"✓ Spotify connected as {who}",
                                    fg="#1DB954")
             # same fresh-install harvest as the webview path (2026-11)
-            try:
-                _cp = os.path.join(os.path.expanduser("~"),
-                                   ".spotify_cookies.txt")
-                _dc = sp.get_sp_dc_from_cookies_file(_cp)
-                if _dc:
-                    with open(sp.SP_DC_PATH, "w", encoding="utf-8") as f:
-                        f.write(_dc)
-                    _dbg("sp_dc harvested post-paste (size only)")
-            except Exception:
-                pass
+            harvest_sp_dc_post_login()
         else:
             messagebox.showerror(
                 "Exchange failed",

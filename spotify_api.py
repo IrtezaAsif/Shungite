@@ -343,6 +343,10 @@ def logged_in_token():
 
 _LIBV3_CACHE = {"sha": "", "ts": 0.0}
 
+# D2 (2026-11): why the last get_my_playlists_dc() degraded or failed
+# (empty string after a clean fetch). Surfaced in the Library tab.
+LIBV3_LAST_REASON = ""
+
 
 def _libraryv3_hash():
     """The libraryV3 persisted-query hash, re-extracted LIVE from the
@@ -411,8 +415,10 @@ def get_my_playlists_dc(limit=50):
     ops-skill-documented route for full-library work; _gql already prefers
     logged_in_token() when a sp_dc exists. None on any failure so callers
     keep their existing fallbacks."""
+    global LIBV3_LAST_REASON
     try:
         if not stored_sp_dc():
+            LIBV3_LAST_REASON = "no sp_dc stored (logged out)"
             return None
         sha = _libraryv3_hash()
         out, offset = [], 0
@@ -428,6 +434,8 @@ def get_my_playlists_dc(limit=50):
             tn = lib.get("__typename") or "LibraryPage"
             if tn != "LibraryPage":
                 if _retried:
+                    LIBV3_LAST_REASON = ("libraryV3 typename=%s after hash "
+                                         "refresh" % tn)
                     break  # GQL errors ride HTTP 200 -- never trust the code
                 # stale persisted-query hash: clear cache, re-extract, retry once
                 _LIBV3_CACHE["sha"] = ""
@@ -437,6 +445,11 @@ def get_my_playlists_dc(limit=50):
                 continue
             rows = lib.get("items") or []
             if not rows:
+                _tc = lib.get("totalCount") or 0
+                if _tc:
+                    LIBV3_LAST_REASON = (
+                        "libraryV3 empty page (offset=%d, total=%s)"
+                        % (offset, _tc))
                 break
             out.extend(_parse_libv3_rows(rows))
             offset += len(rows)
@@ -444,8 +457,15 @@ def get_my_playlists_dc(limit=50):
             if (offset >= total and total) or offset >= 300 or len(out) >= int(limit):
                 break
             time.sleep(1.0)
-        return out or None
-    except Exception:
+        if out:
+            LIBV3_LAST_REASON = ""
+            return out
+        # out empty: any real failure already named itself above; a
+        # genuinely-empty library (totalCount=0) leaves the reason
+        # empty on purpose so D3 can say "logged in but empty".
+        return None
+    except Exception as _e:
+        LIBV3_LAST_REASON = "libraryV3 failed: %s" % str(_e)[:80]
         return None
 
 

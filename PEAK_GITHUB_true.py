@@ -1660,6 +1660,21 @@ def ensure_lyrics(base, url, title, artist="", cookiefile=None,
                     _ten._detect_lang_from_title(title or "", artist or "")
                 for _cand in _ten.rank_vtt_candidates([vtt], _wl):
                     if _ten.vtt_to_lrc(_cand, base + ".lrc"):
+                        try:
+                            with open(base + ".lrc", encoding="utf-8",
+                                      errors="replace") as _lf:
+                                _lt = _lf.read()
+                        except Exception:
+                            _lt = ""
+                        if _lt and _lyric_script_mismatch(
+                                _lt, title or "", artist or ""):
+                            try:
+                                os.remove(base + ".lrc")
+                            except Exception:
+                                pass
+                            _dbg("caption lyrics rejected: script mismatch "
+                                 "vs title/artist (wrong-language ASR/translation)")
+                            continue
                         return "caption"
         if url and _ten.fetch_lyrics_youtube(url, base):
             return "youtube-desc"
@@ -1864,6 +1879,61 @@ def _ytm_fetch_lib_rows(ck):
     """Fetch YT Music library playlist rows with the given cookie dict."""
     import innertube as _itb
     return _itb.get_library_playlists(ck) or []
+
+
+def _lyric_script_mismatch(lyric_text, title, artist):
+    """Caption-lyric script guard (2026-11, the user's Japanese-song bug):
+    a caption-derived lyric whose script contradicts the track's own native
+    script (title/artist evidence) is a mistranslation or forced-ASR
+    artifact - reject it so ensure_lyrics falls through to the description
+    or an honest miss. Deterministic Unicode-range counting: no network,
+    no models, offline-testable. Romanized titles (SPIN) carry no non-Latin
+    evidence and stay accepted - a known residue; LRClib-first + duration
+    keying already fixed that live case."""
+    try:
+        _hint_src = (title or "") + " " + (artist or "")
+        _lyr = lyric_text or ""
+        if len(_lyr) < 20:
+            return False
+
+        def _counts(s):
+            c = {}
+            lat = 0
+            for ch in s:
+                o = ord(ch)
+                if (0x3040 <= o <= 0x30FF or 0x3400 <= o <= 0x4DBF
+                        or 0x4E00 <= o <= 0x9FFF):
+                    c["cjk"] = c.get("cjk", 0) + 1
+                elif (0xAC00 <= o <= 0xD7AF or 0x1100 <= o <= 0x11FF):
+                    c["hangul"] = c.get("hangul", 0) + 1
+                elif 0x0400 <= o <= 0x04FF:
+                    c["cyrillic"] = c.get("cyrillic", 0) + 1
+                elif 0x0600 <= o <= 0x06FF:
+                    c["arabic"] = c.get("arabic", 0) + 1
+                elif 0x0900 <= o <= 0x097F:
+                    c["devanagari"] = c.get("devanagari", 0) + 1
+                elif 0x0590 <= o <= 0x05FF:
+                    c["hebrew"] = c.get("hebrew", 0) + 1
+                elif 0x0E00 <= o <= 0x0E7F:
+                    c["thai"] = c.get("thai", 0) + 1
+                elif ((0x41 <= o <= 0x5A) or (0x61 <= o <= 0x7A)
+                        or (0xC0 <= o <= 0x24F)):
+                    lat += 1
+            return c, lat
+
+        _hc, _hl = _counts(_hint_src)
+        if not _hc:
+            return False  # no non-Latin evidence in title/artist
+        _hint = max(_hc, key=_hc.get)
+        _lc, _ll = _counts(_lyr)
+        if _lc.get(_hint, 0) > 0:
+            return False  # the lyric carries the native script
+        _letters = sum(_lc.values()) + _ll
+        if _letters and _ll / max(_letters, 1) >= 0.9:
+            return True  # Latin lyric for a non-Latin-native song
+        return False
+    except Exception:
+        return False
 
 
 def harvest_sp_dc_post_login():

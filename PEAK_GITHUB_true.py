@@ -4010,13 +4010,17 @@ class App:
 
     def _sp_load(self):
         self._apply_manual_sp_cookie()
-        refresh_stale_sp_dc()
         for r in self._sptree.get_children():
             self._sptree.delete(r)
         self._spmap.clear()
         self._spstat.config(text="● loading…", fg=GOLD)
 
         def run():
+            # (D4 2026-11): stale sp_dc self-heal runs HERE, off the Tk
+            # thread - the browser-cookie scan can take seconds (DPAPI,
+            # profile locks) and must never stall the UI. Runs before the
+            # fetch so stored_sp_dc() below reads the refreshed token.
+            refresh_stale_sp_dc()
             sections = []
 
             # OAuth library first (your real playlists) when connected

@@ -1214,6 +1214,21 @@ def _norm_txt(s):
     return _r.sub(r"[^a-z0-9 ]+", " ", s)
 
 
+_ARTIST_STOP = {"the", "and", "feat", "ft", "with", "of", "in", "on", "for",
+                "my", "your", "or", "to", "a", "an", "x", "by", "vs"}
+
+
+def _artist_tokens(artist):
+    """Content tokens of an artist name, stopwords dropped.
+
+    'Demi the Daredevil' must not satisfy artist containment against any
+    title containing the word 'the' (the Chemical-Rabbit-Hole class of
+    false wins caught by tests/test_search_match.py)."""
+    raw = [t for t in _norm_txt(artist).split() if len(t) > 1]
+    content = [t for t in raw if t not in _ARTIST_STOP]
+    return set(content) if content else set(raw)
+
+
 def pick_best(results, target_seconds=None, artist="", title="",
               browser=None, cookiefile=None, enrich_top=0):
     """Score ytsearch results and return the best match.
@@ -1275,6 +1290,7 @@ def pick_best(results, target_seconds=None, artist="", title="",
     results = cand + rest
 
     import math
+    a_tok = _artist_tokens(artist)
     best, best_score = None, float("-inf")
     for r in results:
         dur = norm_dur(r)
@@ -1290,9 +1306,28 @@ def pick_best(results, target_seconds=None, artist="", title="",
             dur_score = 10.0 * max(0.0, 1.0 - diff / max(target_seconds, 1))
         else:
             dur_score = 5.0                   # unknown/ignored target: neutral
-        views_score = math.log10((r.get("views") or 0) + 1) * 2.0
         hay = _norm_txt(f'{r.get("channel", "")} {r.get("title", "")}')
+        _raw = r.get("title") or ""
+        _raw_ratio = (difflib.SequenceMatcher(None, q_t, _norm_q(_raw)).ratio()
+                      if q_t else 0.0)
+        # GATE 1 (2026-11): the artist must appear in channel+title, unless
+        # the raw title is a strong hit on an official/Topic channel (the
+        # punctuation bridge _loose_match uses).
+        _ch_low = (r.get("channel") or "").lower()
+        _bridge = (_raw_ratio >= 0.55
+                   and ("topic" in _ch_low or "official" in _raw.lower()))
+        if a_tok and not any(t in hay for t in a_tok) and not _bridge:
+            continue                          # different song entirely -> skip
         sim = difflib.SequenceMatcher(None, q_t, hay).ratio() * 6.0 if q_t else 0.0
+        # GATE 2 (2026-11): similarity floor, same punctuation-bridge rescue
+        if sim / 6.0 < 0.32:
+            if _bridge:
+                sim = _raw_ratio * 6.0
+            if sim / 6.0 < 0.32:
+                continue                      # not this song -> skip
+        # views capped (2026-11): popularity must not out-vote title+artist
+        # similarity (the 'Chemical Rabbit Hole' -> Adam Lambert class).
+        views_score = min(math.log10((r.get("views") or 0) + 1) * 2.0, 8.0)
         pen = 0.0
         t_low = _norm_txt(r.get("title", ""))
         for w in _BAD_WORDS:
@@ -1301,7 +1336,7 @@ def pick_best(results, target_seconds=None, artist="", title="",
         score = views_score + dur_score + sim - pen
         if score > best_score:
             best, best_score = r, score
-    return best or (results[0] if results else None)
+    return best
 
 
 # ── GUI ────────────────────────────────────────────────────────────────────────
@@ -1415,7 +1450,7 @@ def _loose_match(results, track, artist):
     import matchers as _mt
     _n = _mt._norm
     tq, aq = _n(track), _n(artist)
-    a_tok = set(t for t in aq.split() if len(t) > 2)
+    a_tok = _artist_tokens(artist)
     if not a_tok:
         return None
     junk = ("1 hour", "1hour", "mix", "full album", "reaction", "reacts",
@@ -4286,6 +4321,11 @@ class App:
                             best = _mt.strict_match(hits, tname, tartist)
                         except Exception:
                             best = None
+                        if best is None:
+                            try:
+                                best = _loose_match(hits, tname, tartist)
+                            except Exception:
+                                best = None
                         if best is None:
                             try:
                                 best = pick_best(hits, target_seconds=tsec,
